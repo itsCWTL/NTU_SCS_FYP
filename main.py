@@ -265,12 +265,246 @@ def identify_shape_type(num_vertices, circularity=0, extent=0):
     else:
         return "Unknown"
 
-def detect_grid_patterns_robust(image_path):
-    # 1. Load and Preprocess 
-    img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+# def detect_grid_patterns_robust(image_path):
+#     # 1. Load and Preprocess 
+#     img = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+#     if img is None:
+#         print(f"Error: Could not find image at {image_path}")
+#         return
+
+#     # Invert (Lines = White) 
+#     _, binary = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY_INV)
+    
+#     # Morphological Close to fill gaps for skeletonization 
+#     kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5,5))
+#     binary_closed = cv2.morphologyEx(binary, cv2.MORPH_CLOSE, kernel)
+
+#     # 2. Detect Shape 
+#     contours, _ = cv2.findContours(binary, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+#     if not contours:
+#         print("No contours found.")
+#         return
+    
+#     main_contour = max(contours, key=cv2.contourArea)
+#     shape_type, shape_vertices = get_refined_shape(main_contour)
+#     # print(f"Detected Outer Shape: {shape_type}")
+    
+#     # Calculate circularity and extent for shape identification
+#     area = cv2.contourArea(main_contour)
+#     perimeter = cv2.arcLength(main_contour, True)
+#     circularity = (4 * np.pi * area) / (perimeter**2) if perimeter > 0 else 0
+#     (x, y), radius = cv2.minEnclosingCircle(main_contour)
+#     enclosing_circle_area = np.pi * (radius**2)
+#     extent = area / enclosing_circle_area if enclosing_circle_area > 0 else 0
+
+#     # 3. Skeletonize and find Junctions 
+#     skeleton = skeletonize(binary_closed // 255).astype(np.uint8)
+    
+#     # Detect junction pixels (neighbor count > 2) 
+#     neighbor_kernel = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]], dtype=np.uint8)
+#     neighbors = cv2.filter2D(skeleton, -1, neighbor_kernel)
+#     junction_pixels = np.where((neighbors * skeleton) >= 3, 255, 0).astype(np.uint8)
+    
+#     # Merge nearby junction pixels into single blobs 
+#     junction_blobs = cv2.dilate(junction_pixels, np.ones((9,9), np.uint8), iterations=2)
+#     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(junction_blobs)
+    
+#     # Create combined list of ALL nodes (junctions + shape vertices)
+#     all_nodes = []
+    
+#     # First add all junction centroids
+#     for i in range(1, num_labels):
+#         cx, cy = int(centroids[i][0]), int(centroids[i][1])
+#         all_nodes.append((cx, cy, 'junction'))
+    
+#     # Then add shape vertices (if polygon)
+#     if shape_type != "Circle" and len(shape_vertices) > 0:
+#         for (vx, vy) in shape_vertices:
+#             # Check if vertex is already close to a junction
+#             is_duplicate = False
+#             for (jx, jy, _) in all_nodes:
+#                 distance = np.sqrt((vx - jx)**2 + (vy - jy)**2)
+#                 if distance < 20:  # If vertex is too close to existing junction
+#                     is_duplicate = True
+#                     break
+            
+#             if not is_duplicate:
+#                 all_nodes.append((vx, vy, 'vertex'))
+    
+#     # Update total nodes count
+#     total_nodes = len(all_nodes)
+
+#     # 4. If shape is polygon, get vertices for verification
+#     if shape_type != "Circle" and len(shape_vertices) > 0:
+#         # Use shape vertices from code A
+#         print(f"Using {len(shape_vertices)} vertices from shape detection")
+#     else:
+#         # Fall back to shape vertex detection 
+#         shape_vertices = detect_shape_vertices(binary)
+#         if len(shape_vertices) >= 3:
+#             # Verify corners with skeleton analysis
+#             verified_corners = detect_and_verify_corners(binary, skeleton)
+#             if len(verified_corners) >= 3:
+#                 shape_vertices = verified_corners
+#                 # print(f"Verified corners found: {len(shape_vertices)} vertices")
+
+#     # 5. Process Result Image
+#     output_img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    
+#     # Initialize counters
+#     pattern_counts = {2: 0, 3: 0, 4: 0, 6: 0, 8: 0, "other": 0}
+    
+#     # Process each node (junctions + vertices)
+#     for node in all_nodes:
+#         cx, cy, node_type = node
+#         is_shape_vertex = (node_type == 'vertex')
+        
+#         # Determine degree with appropriate method
+#         if is_shape_vertex:
+#             # For shape vertices - use standard method
+#             degree = count_branches_standard(skeleton, cy, cx, radius=10)
+#         else:
+#             # For junctions - use robust method
+#             degree = count_branches_robust(skeleton, cy, cx, radius=15)
+        
+#         # Classification and coloring - ALL degree2 nodes are counted as 2
+#         if degree == 2:
+#             if is_shape_vertex:
+#                 color = (255, 0, 255)  # Magenta for shape vertices
+#             else:
+#                 # All other degree-2 nodes (curves, corners)
+#                 color = (200, 0, 200)  # Lighter magenta
+#             pattern_counts[2] += 1  # Always count as degree 2
+            
+#             # Draw shape vertices with green dot AND magenta circle
+#             if is_shape_vertex:
+#                 cv2.circle(output_img, (cx, cy), 8, (0, 255, 0), -1)  # Green dot
+#                 cv2.circle(output_img, (cx, cy), 12, color, 2)  # Magenta circle
+#                 cv2.putText(output_img, str(degree), (cx-15, cy-15), 
+#                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+#             else:
+#                 cv2.circle(output_img, (cx, cy), 10, color, 2)
+#                 cv2.putText(output_img, str(degree), (cx-15, cy-15), 
+#                            cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+                
+#         elif degree == 3:
+#             color = (0, 0, 255)  # Red
+#             pattern_counts[3] += 1
+#             cv2.circle(output_img, (cx, cy), 10, color, 2)
+#             cv2.putText(output_img, str(degree), (cx-15, cy-15), 
+#                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+#         elif degree == 4:
+#             color = (255, 0, 0)  # Blue
+#             pattern_counts[4] += 1
+#             cv2.circle(output_img, (cx, cy), 10, color, 2)
+#             cv2.putText(output_img, str(degree), (cx-15, cy-15), 
+#                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+#         elif degree == 6: 
+#             color = (0, 255, 0)  # Green
+#             pattern_counts[6] += 1
+#             cv2.circle(output_img, (cx, cy), 10, color, 2)
+#             cv2.putText(output_img, str(degree), (cx-15, cy-15), 
+#                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+#         elif degree == 8:  
+#             color = (255, 255, 0)  # Cyan
+#             pattern_counts[8] += 1
+#             cv2.circle(output_img, (cx, cy), 10, color, 2)
+#             cv2.putText(output_img, str(degree), (cx-15, cy-15), 
+#                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
+#         else:
+#             pattern_counts["other"] += 1
+#             color = (128, 128, 128)  # Gray for other nodes
+#             cv2.circle(output_img, (cx, cy), 6, color, 1)
+#             cv2.putText(output_img, str(degree), (cx-10, cy-10), 
+#                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
+    
+#     # 6. Draw shape outline if it's a polygon
+#     if shape_type != "Circle" and len(shape_vertices) >= 3:
+#         # Draw connecting lines
+#         for i in range(len(shape_vertices)):
+#             pt1 = shape_vertices[i]
+#             pt2 = shape_vertices[(i + 1) % len(shape_vertices)]
+#             cv2.line(output_img, pt1, pt2, (0, 255, 255), 2)  # Yellow lines
+#     elif shape_type == "Circle":
+#         # Draw circle outline
+#         (x, y), radius = cv2.minEnclosingCircle(main_contour)
+#         center = (int(x), int(y))
+#         radius = int(radius)
+#         cv2.circle(output_img, center, radius, (0, 255, 255), 2)  # Yellow circle
+
+#     # 7. Display results
+#     plt.figure(figsize=(10, 8))
+#     plt.imshow(cv2.cvtColor(output_img, cv2.COLOR_BGR2RGB))
+#     plt.title(f"Outer Shape: {shape_type}")
+#     plt.axis('off')
+#     plt.show()
+
+#     # 8. Detailed Report
+#     print("\n" + "=" * 60)
+#     print("SHAPE AND GRID PATTERN ANALYSIS")
+#     print("=" * 60)
+#     print(f"Detected Shape: {shape_type}")
+    
+#     # if shape_type != "Circle":
+#     #     print(f"Number of vertices: {len(shape_vertices)}")
+        
+#     #     if len(shape_vertices) >= 3:
+#     #         print("\nVertex coordinates:")
+#     #         for i, (x, y) in enumerate(shape_vertices):
+#     #             print(f"  Vertex {i+1}: ({x}, {y})")
+            
+#     #         # Calculate side lengths
+#     #         print("\nSide lengths:")
+#     #         side_lengths = []
+#     #         for i in range(len(shape_vertices)):
+#     #             x1, y1 = shape_vertices[i]
+#     #             x2, y2 = shape_vertices[(i + 1) % len(shape_vertices)]
+#     #             length = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
+#     #             side_lengths.append(length)
+#     #             print(f"  Side {i+1}: {length:.1f} pixels")
+            
+#     #         avg_side = np.mean(side_lengths)
+#     #         std_side = np.std(side_lengths)
+#     #         print(f"\nAverage side length: {avg_side:.1f} pixels")
+#     #         print(f"Standard deviation: {std_side:.1f} pixels")
+            
+#     #         if std_side / avg_side < 0.15:
+#     #             print("Shape appears regular")
+#     #         else:
+#     #             print("Shape appears irregular")
+#     # else:
+#     #     print(f"Circle center: ({int(x)}, {int(y)})")
+#     #     print(f"Circle radius: {radius:.1f} pixels")
+#     #     print(f"Circularity: {circularity:.3f}")
+#     #     print(f"Extent (area/enclosing circle): {extent:.3f}")
+    
+#     # print("\nINTERSECTION ANALYSIS:")
+#     # print(f"Total detected nodes: {total_nodes}")
+#     # shape_vertex_count = len([n for n in all_nodes if n[2] == 'vertex'])
+#     # junction_count = len([n for n in all_nodes if n[2] == 'junction'])
+#     # print(f"  - Shape vertices: {shape_vertex_count}")
+#     # print(f"  - Internal junctions: {junction_count}")
+#     print("\nRESULT:")
+#     print(f"  Degree 2: {pattern_counts[2]}")
+#     print(f"  Degree 3: {pattern_counts[3]}")
+#     print(f"  Degree 4: {pattern_counts[4]}")
+#     print(f"  Degree 6: {pattern_counts[6]}")
+#     print(f"  Degree 8: {pattern_counts[8]}")
+#     print(f"  Other/Unclassified: {pattern_counts['other']}")
+
+def detect_grid_patterns_robust(img):
+    """
+    img: numpy array (grayscale)
+    Returns dict with output image, shape type, and degree counts
+    """
     if img is None:
-        print(f"Error: Could not find image at {image_path}")
+        print("Error: No image provided")
         return
+
+    # 1. Preprocess
+    # Ensure image is grayscale
+    if len(img.shape) == 3:
+        img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
     # Invert (Lines = White) 
     _, binary = cv2.threshold(img, 127, 255, cv2.THRESH_BINARY_INV)
@@ -287,9 +521,8 @@ def detect_grid_patterns_robust(image_path):
     
     main_contour = max(contours, key=cv2.contourArea)
     shape_type, shape_vertices = get_refined_shape(main_contour)
-    # print(f"Detected Outer Shape: {shape_type}")
     
-    # Calculate circularity and extent for shape identification
+    # Circularity and extent
     area = cv2.contourArea(main_contour)
     perimeter = cv2.arcLength(main_contour, True)
     circularity = (4 * np.pi * area) / (perimeter**2) if perimeter > 0 else 0
@@ -297,201 +530,84 @@ def detect_grid_patterns_robust(image_path):
     enclosing_circle_area = np.pi * (radius**2)
     extent = area / enclosing_circle_area if enclosing_circle_area > 0 else 0
 
-    # 3. Skeletonize and find Junctions 
+    # 3. Skeletonize and find Junctions
     skeleton = skeletonize(binary_closed // 255).astype(np.uint8)
     
-    # Detect junction pixels (neighbor count > 2) 
-    neighbor_kernel = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]], dtype=np.uint8)
+    neighbor_kernel = np.array([[1,1,1],[1,0,1],[1,1,1]], dtype=np.uint8)
     neighbors = cv2.filter2D(skeleton, -1, neighbor_kernel)
     junction_pixels = np.where((neighbors * skeleton) >= 3, 255, 0).astype(np.uint8)
     
-    # Merge nearby junction pixels into single blobs 
     junction_blobs = cv2.dilate(junction_pixels, np.ones((9,9), np.uint8), iterations=2)
     num_labels, labels, stats, centroids = cv2.connectedComponentsWithStats(junction_blobs)
     
-    # Create combined list of ALL nodes (junctions + shape vertices)
     all_nodes = []
-    
-    # First add all junction centroids
     for i in range(1, num_labels):
         cx, cy = int(centroids[i][0]), int(centroids[i][1])
         all_nodes.append((cx, cy, 'junction'))
     
-    # Then add shape vertices (if polygon)
     if shape_type != "Circle" and len(shape_vertices) > 0:
         for (vx, vy) in shape_vertices:
-            # Check if vertex is already close to a junction
             is_duplicate = False
             for (jx, jy, _) in all_nodes:
-                distance = np.sqrt((vx - jx)**2 + (vy - jy)**2)
-                if distance < 20:  # If vertex is too close to existing junction
+                if np.sqrt((vx - jx)**2 + (vy - jy)**2) < 20:
                     is_duplicate = True
                     break
-            
             if not is_duplicate:
                 all_nodes.append((vx, vy, 'vertex'))
     
-    # Update total nodes count
     total_nodes = len(all_nodes)
-
-    # 4. If shape is polygon, get vertices for verification
-    if shape_type != "Circle" and len(shape_vertices) > 0:
-        # Use shape vertices from code A
-        print(f"Using {len(shape_vertices)} vertices from shape detection")
-    else:
-        # Fall back to shape vertex detection 
-        shape_vertices = detect_shape_vertices(binary)
-        if len(shape_vertices) >= 3:
-            # Verify corners with skeleton analysis
-            verified_corners = detect_and_verify_corners(binary, skeleton)
-            if len(verified_corners) >= 3:
-                shape_vertices = verified_corners
-                # print(f"Verified corners found: {len(shape_vertices)} vertices")
 
     # 5. Process Result Image
     output_img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
+    pattern_counts = {2:0,3:0,4:0,6:0,8:0,"other":0}
     
-    # Initialize counters
-    pattern_counts = {2: 0, 3: 0, 4: 0, 6: 0, 8: 0, "other": 0}
-    
-    # Process each node (junctions + vertices)
     for node in all_nodes:
         cx, cy, node_type = node
         is_shape_vertex = (node_type == 'vertex')
         
-        # Determine degree with appropriate method
         if is_shape_vertex:
-            # For shape vertices - use standard method
             degree = count_branches_standard(skeleton, cy, cx, radius=10)
         else:
-            # For junctions - use robust method
             degree = count_branches_robust(skeleton, cy, cx, radius=15)
         
-        # Classification and coloring - ALL degree2 nodes are counted as 2
         if degree == 2:
-            if is_shape_vertex:
-                color = (255, 0, 255)  # Magenta for shape vertices
-            else:
-                # All other degree-2 nodes (curves, corners)
-                color = (200, 0, 200)  # Lighter magenta
-            pattern_counts[2] += 1  # Always count as degree 2
-            
-            # Draw shape vertices with green dot AND magenta circle
-            if is_shape_vertex:
-                cv2.circle(output_img, (cx, cy), 8, (0, 255, 0), -1)  # Green dot
-                cv2.circle(output_img, (cx, cy), 12, color, 2)  # Magenta circle
-                cv2.putText(output_img, str(degree), (cx-15, cy-15), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-            else:
-                cv2.circle(output_img, (cx, cy), 10, color, 2)
-                cv2.putText(output_img, str(degree), (cx-15, cy-15), 
-                           cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-                
+            color = (0,255,0) if is_shape_vertex else (200,0,200)
+            pattern_counts[2] += 1
+            cv2.circle(output_img, (cx, cy), 10, color, 2)
         elif degree == 3:
-            color = (0, 0, 255)  # Red
+            color = (0,0,255)
             pattern_counts[3] += 1
             cv2.circle(output_img, (cx, cy), 10, color, 2)
-            cv2.putText(output_img, str(degree), (cx-15, cy-15), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
         elif degree == 4:
-            color = (255, 0, 0)  # Blue
+            color = (255,0,0)
             pattern_counts[4] += 1
             cv2.circle(output_img, (cx, cy), 10, color, 2)
-            cv2.putText(output_img, str(degree), (cx-15, cy-15), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-        elif degree == 6: 
-            color = (0, 255, 0)  # Green
+        elif degree == 6:
+            color = (0,255,0)
             pattern_counts[6] += 1
             cv2.circle(output_img, (cx, cy), 10, color, 2)
-            cv2.putText(output_img, str(degree), (cx-15, cy-15), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
-        elif degree == 8:  
-            color = (255, 255, 0)  # Cyan
+        elif degree == 8:
+            color = (255,255,0)
             pattern_counts[8] += 1
             cv2.circle(output_img, (cx, cy), 10, color, 2)
-            cv2.putText(output_img, str(degree), (cx-15, cy-15), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.5, color, 2)
         else:
+            color = (128,128,128)
             pattern_counts["other"] += 1
-            color = (128, 128, 128)  # Gray for other nodes
             cv2.circle(output_img, (cx, cy), 6, color, 1)
-            cv2.putText(output_img, str(degree), (cx-10, cy-10), 
-                       cv2.FONT_HERSHEY_SIMPLEX, 0.4, color, 1)
     
-    # 6. Draw shape outline if it's a polygon
     if shape_type != "Circle" and len(shape_vertices) >= 3:
-        # Draw connecting lines
         for i in range(len(shape_vertices)):
             pt1 = shape_vertices[i]
-            pt2 = shape_vertices[(i + 1) % len(shape_vertices)]
-            cv2.line(output_img, pt1, pt2, (0, 255, 255), 2)  # Yellow lines
-    elif shape_type == "Circle":
-        # Draw circle outline
-        (x, y), radius = cv2.minEnclosingCircle(main_contour)
+            pt2 = shape_vertices[(i+1)%len(shape_vertices)]
+            cv2.line(output_img, pt1, pt2, (0,255,255),2)
+    elif shape_type=="Circle":
         center = (int(x), int(y))
         radius = int(radius)
-        cv2.circle(output_img, center, radius, (0, 255, 255), 2)  # Yellow circle
-
-    # 7. Display results
-    plt.figure(figsize=(10, 8))
-    plt.imshow(cv2.cvtColor(output_img, cv2.COLOR_BGR2RGB))
-    plt.title(f"Outer Shape: {shape_type}")
-    plt.axis('off')
-    plt.show()
-
-    # 8. Detailed Report
-    print("\n" + "=" * 60)
-    print("SHAPE AND GRID PATTERN ANALYSIS")
-    print("=" * 60)
-    print(f"Detected Shape: {shape_type}")
+        cv2.circle(output_img, center, radius, (0,255,255),2)
     
-    # if shape_type != "Circle":
-    #     print(f"Number of vertices: {len(shape_vertices)}")
-        
-    #     if len(shape_vertices) >= 3:
-    #         print("\nVertex coordinates:")
-    #         for i, (x, y) in enumerate(shape_vertices):
-    #             print(f"  Vertex {i+1}: ({x}, {y})")
-            
-    #         # Calculate side lengths
-    #         print("\nSide lengths:")
-    #         side_lengths = []
-    #         for i in range(len(shape_vertices)):
-    #             x1, y1 = shape_vertices[i]
-    #             x2, y2 = shape_vertices[(i + 1) % len(shape_vertices)]
-    #             length = np.sqrt((x2 - x1)**2 + (y2 - y1)**2)
-    #             side_lengths.append(length)
-    #             print(f"  Side {i+1}: {length:.1f} pixels")
-            
-    #         avg_side = np.mean(side_lengths)
-    #         std_side = np.std(side_lengths)
-    #         print(f"\nAverage side length: {avg_side:.1f} pixels")
-    #         print(f"Standard deviation: {std_side:.1f} pixels")
-            
-    #         if std_side / avg_side < 0.15:
-    #             print("Shape appears regular")
-    #         else:
-    #             print("Shape appears irregular")
-    # else:
-    #     print(f"Circle center: ({int(x)}, {int(y)})")
-    #     print(f"Circle radius: {radius:.1f} pixels")
-    #     print(f"Circularity: {circularity:.3f}")
-    #     print(f"Extent (area/enclosing circle): {extent:.3f}")
-    
-    # print("\nINTERSECTION ANALYSIS:")
-    # print(f"Total detected nodes: {total_nodes}")
-    # shape_vertex_count = len([n for n in all_nodes if n[2] == 'vertex'])
-    # junction_count = len([n for n in all_nodes if n[2] == 'junction'])
-    # print(f"  - Shape vertices: {shape_vertex_count}")
-    # print(f"  - Internal junctions: {junction_count}")
-    print("\nRESULT:")
-    print(f"  Degree 2: {pattern_counts[2]}")
-    print(f"  Degree 3: {pattern_counts[3]}")
-    print(f"  Degree 4: {pattern_counts[4]}")
-    print(f"  Degree 6: {pattern_counts[6]}")
-    print(f"  Degree 8: {pattern_counts[8]}")
-    print(f"  Other/Unclassified: {pattern_counts['other']}")
+    return {"output_img": output_img, "shape_type": shape_type, "pattern_counts": pattern_counts}
+
 
 # Testing 
 if __name__ == "__main__":
-    detect_grid_patterns_robust('images/circle2.png')
+    detect_grid_patterns_robust('images/circle3.png')
