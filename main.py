@@ -4,6 +4,20 @@ import matplotlib.pyplot as plt
 from skimage.morphology import skeletonize
 import math
 
+DEGREE_COLORS = {
+    2:  (200, 0, 200),    # purple
+    3:  (0, 0, 255),      # red
+    4:  (255, 0, 0),      # blue
+    5:  (0, 165, 255),    # orange
+    6:  (0, 255, 0),      # green
+    7:  (255, 255, 0),    # cyan
+    8:  (0, 255, 255),    # yellow
+    9:  (255, 0, 255),    # magenta
+    10: (128, 255, 0),    # spring green
+    11: (255, 128, 0),    # azure
+    12: (0, 128, 255),    # amber
+}
+
 def remove_small_components(binary_img, min_area_ratio=0.02):
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary_img)
     if num_labels <= 1:
@@ -397,7 +411,7 @@ def detect_grid_patterns_robust(img, prune_length=4):
                 all_nodes.append((vx, vy, 'vertex'))
 
     output_img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-    pattern_counts = {2: 0, 3: 0, 4: 0, 6: 0, 8: 0, "other": 0}
+    pattern_counts = {2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0, 8: 0, 9: 0, 10: 0, 11: 0, 12: 0, "other": 0}
 
     # straight line test
     edge_tol = max(4, img_diag // 200)        # how close to an edge counts as "on it"
@@ -747,26 +761,10 @@ def detect_grid_patterns_robust(img, prune_length=4):
         # Wedge angles around this node, each with its bisector for label placement.
         wedges = compute_wedge_angles(cx, cy, is_shape_vertex)
 
-        if degree == 2:
-            pattern_counts[2] += 1
+        if degree in DEGREE_COLORS:
+            pattern_counts[degree] += 1
             draw_marker(output_img, cx, cy, marker_radius,
-                        (200, 0, 200), marker_thickness, use_square)
-        elif degree == 3:
-            pattern_counts[3] += 1
-            draw_marker(output_img, cx, cy, marker_radius,
-                        (0, 0, 255), marker_thickness, use_square)
-        elif degree == 4:
-            pattern_counts[4] += 1
-            draw_marker(output_img, cx, cy, marker_radius,
-                        (255, 0, 0), marker_thickness, use_square)
-        elif degree == 6:
-            pattern_counts[6] += 1
-            draw_marker(output_img, cx, cy, marker_radius,
-                        (0, 255, 0), marker_thickness, use_square)
-        elif degree == 8:
-            pattern_counts[8] += 1
-            draw_marker(output_img, cx, cy, marker_radius,
-                        (255, 255, 0), marker_thickness, use_square)
+                        DEGREE_COLORS[degree], marker_thickness, use_square)
         else:
             pattern_counts["other"] += 1
             draw_marker(output_img, cx, cy, max(4, marker_radius // 2),
@@ -875,7 +873,7 @@ def detect(img, force_segment=None, min_dimension=800):
         return None
 
     combined_output = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
-    combined_counts = {2: 0, 3: 0, 4: 0, 6: 0, 8: 0, "other": 0}
+    combined_counts = {2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0, 8: 0, 9: 0, 10: 0, 11: 0, 12: 0, "other": 0}
     shape_results = []
 
     for idx, (sub_img, (x_off, y_off)) in enumerate(sub_images):
