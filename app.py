@@ -20,21 +20,20 @@ if uploaded_file is not None:
         # Show the annotated output
         st.image(
             cv2.cvtColor(result["output_img"], cv2.COLOR_BGR2RGB),
-            caption="Detection Result",
+            caption=f"Detection Result",
             use_container_width=True
         )
 
         # Show summary
-        st.subheader(f"Found {result['num_shapes']} shape(s)")
+        st.subheader("Detection Summary")
+        
+        # Display the number of circles found
+        st.write(f"**Circles Detected:** {result['circle_count']}")
 
-        # Per-shape breakdown
-        for s in result["shapes"]:
-            st.markdown(f"**Shape {s['shape_index'] + 1}: {s['shape_type']}**")
-            # Only show degrees with non-zero counts
-            nonzero = {f"Degree {k}": v for k, v in s["pattern_counts"].items() if v}
-            st.json(nonzero)
-
-        # Combined totals across all shapes
-        st.subheader("Combined Totals")
-        nonzero_total = {f"Degree {k}": v for k, v in result["total_counts"].items() if v}
-        st.json(nonzero_total)
+        # Display the degree counts (only showing non-zero values)
+        st.write("**Degrees Found:**")
+        nonzero = {f"Degree {k}": v for k, v in result["pattern_counts"].items() if v}
+        st.json(nonzero)
+        
+    else:
+        st.warning("No patterns detected in the image.")
