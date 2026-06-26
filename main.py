@@ -1233,6 +1233,104 @@ def add_concentric_circles(skeleton, circles, min_r, step=4,
     return out
 
 
+def _circle_tangent_misalign(skeleton, cx, cy, r, snap=4, win=5, step=6,
+                             dev_thresh=22.0):
+    """Fraction of the circumference where the local skeleton direction does
+    NOT run tangent to the circle. A real circle's skeleton is tangent
+    everywhere (~0); a circle fitted through straight grid edges only touches
+    tangentially at a few points, so it is high (~0.5). Returns -1 if too few
+    samples to judge."""
+    H, W = skeleton.shape
+    bad = 0; tot = 0
+    for d in range(0, 360, step):
+        a = math.radians(d)
+        px = cx + r * math.cos(a); py = cy + r * math.sin(a)
+        best = None; bd = snap + 0.5
+        for rr in range(-snap, snap + 1):
+            for cc in range(-snap, snap + 1):
+                yy = int(round(py)) + rr; xx = int(round(px)) + cc
+                if 0 <= yy < H and 0 <= xx < W and skeleton[yy, xx]:
+                    dd = math.hypot(cc, rr)
+                    if dd < bd:
+                        bd = dd; best = (xx, yy)
+        if best is None:
+            continue
+        bx, by = best; pts = []
+        for rr in range(-win, win + 1):
+            for cc in range(-win, win + 1):
+                yy = by + rr; xx = bx + cc
+                if 0 <= yy < H and 0 <= xx < W and skeleton[yy, xx]:
+                    pts.append((cc, rr))
+        if len(pts) < 4:
+            continue
+        P = np.asarray(pts, float); P -= P.mean(0)
+        try:
+            _, _, vt = np.linalg.svd(P, full_matrices=False)
+        except np.linalg.LinAlgError:
+            continue
+        sd = vt[0]
+        tan = (-math.sin(a), math.cos(a))
+        dot = max(0.0, min(1.0, abs(sd[0] * tan[0] + sd[1] * tan[1])))
+        tot += 1
+        if math.degrees(math.acos(dot)) > dev_thresh:
+            bad += 1
+    if tot < 20:
+        return -1.0
+    return bad / tot
+
+
+def _circle_shape_ok(skeleton, cx, cy, r):
+    """True if the candidate's skeleton really behaves like a circle.
+    Rejects: grid-inscribed circles (high tangent misalignment) and polygon
+    rings (many vertices). A genuine circle is tangent everywhere with few
+    sharp turns; rings that pass through other shapes (real) keep a low
+    vertex count even if misalignment is slightly raised."""
+    ma = _circle_tangent_misalign(skeleton, cx, cy, r)
+    if ma > 0.30:
+        return False
+    vc = _circle_vertex_count(skeleton, cx, cy, r)
+    # graded: more vertices => require lower misalignment to accept
+    if vc >= 10 and ma >= 0.12:
+        return False
+    if vc >= 9 and ma >= 0.18:
+        return False
+    return True
+
+
+def _circle_vertex_count(skeleton, cx, cy, r, snap=6, step=4, turn_thresh=22):
+    """Count sharp turns (vertices) of the skeleton around a candidate circle.
+    A real circle curves smoothly (few turns); a polygon ring of straight
+    edges (e.g. a hexagon of triangle edges) has many turns."""
+    H, W = skeleton.shape
+    pts = []
+    for d in range(0, 360, step):
+        a = math.radians(d)
+        px = cx + r * math.cos(a); py = cy + r * math.sin(a)
+        best = None; bd = snap + 0.5
+        for rr in range(-snap, snap + 1):
+            for cc in range(-snap, snap + 1):
+                yy = int(round(py)) + rr; xx = int(round(px)) + cc
+                if 0 <= yy < H and 0 <= xx < W and skeleton[yy, xx]:
+                    dd = math.hypot(cc, rr)
+                    if dd < bd:
+                        bd = dd; best = (xx, yy)
+        pts.append(best)
+    valid = [p for p in pts if p is not None]
+    if len(valid) < 8:
+        return 99
+    turns = 0; n = len(valid)
+    for i in range(n):
+        a = valid[i - 1]; bp = valid[i]; c = valid[(i + 1) % n]
+        v1 = (bp[0] - a[0], bp[1] - a[1]); v2 = (c[0] - bp[0], c[1] - bp[1])
+        n1 = math.hypot(*v1); n2 = math.hypot(*v2)
+        if n1 < 2 or n2 < 2:
+            continue
+        dot = max(-1.0, min(1.0, (v1[0] * v2[0] + v1[1] * v2[1]) / (n1 * n2)))
+        if math.degrees(math.acos(dot)) > turn_thresh:
+            turns += 1
+    return turns
+
+
 def _circle_coverage(dt, H, W, cx, cy, r, tol, samples=720):
     hit = 0
     for d in range(samples):
@@ -1263,7 +1361,8 @@ def filter_real_circles(skeleton, circles, cov_thresh=0.95, **_):
     dt = cv2.distanceTransform(src, cv2.DIST_L2, 3)
     H, W = skeleton.shape
     return [(cx, cy, r) for (cx, cy, r) in circles
-            if _circle_coverage(dt, H, W, cx, cy, r, 5) >= cov_thresh]
+            if _circle_coverage(dt, H, W, cx, cy, r, 5) >= cov_thresh
+            and _circle_shape_ok(skeleton, cx, cy, r)]
 
 def find_center_rings(skeleton, cx0, cy0, min_r, max_r, step=4):
     """Find big concentric rings centred near (cx0,cy0) that the other circle
@@ -1291,6 +1390,35 @@ def find_center_rings(skeleton, cx0, cy0, min_r, max_r, step=4):
                 continue
         r += step
     return out
+
+
+def detect_corner_nodes(skeleton, existing, circles=None, circle_tol=12,
+                        min_dist=24, bend_dot=-0.85):
+    """Find genuine degree-2 corners (a sharp bend where two straight edges
+    meet) that are neither junctions nor polygon vertices, e.g. the inner
+    corners of a star outline. Smooth curves/circles have no sharp bend, and
+    points lying on a detected circle are excluded (a circle is not a corner)."""
+    nk = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]], dtype=np.uint8)
+    nb = cv2.filter2D(skeleton, -1, nk)
+    ys, xs = np.where((skeleton == 1) & (nb == 2))
+    md2 = min_dist * min_dist
+    circles = circles or []
+    found = []
+    for x, y in zip(xs.tolist(), ys.tolist()):
+        if any((x - cx) ** 2 + (y - cy) ** 2 < md2 for cx, cy in existing):
+            continue
+        if any((x - fx) ** 2 + (y - fy) ** 2 < md2 for fx, fy, _ in found):
+            continue
+        if any(abs(math.hypot(x - cx, y - cy) - r) < circle_tol
+               for (cx, cy, r) in circles):
+            continue                                   # on a circle, not a corner
+        arms = _trace_arms_simple(skeleton, y, x, core=3, length=18)
+        if len(arms) != 2 or not (arms[0][1] and arms[1][1]):
+            continue
+        d1, d2 = arms[0][0], arms[1][0]
+        if d1[0] * d2[0] + d1[1] * d2[1] > bend_dot:   # sharp bend
+            found.append((x, y, 'corner_pt'))
+    return found
 
 
 def detect_grid_patterns_robust(img, prune_length=4):
@@ -1335,9 +1463,10 @@ def detect_grid_patterns_robust(img, prune_length=4):
         for (rx, ry, rr) in find_center_rings(
                 raw_skel, cxm, cym,
                 min_r=int(small_r * 1.6), max_r=int(max(img_h, img_w) * 0.5)):
-            if all(abs(rr - c[2]) > max(10, 0.1 * rr) or
-                   (rx - c[0]) ** 2 + (ry - c[1]) ** 2 > (0.2 * rr) ** 2
-                   for c in detected_circles):
+            if (_circle_shape_ok(raw_skel, rx, ry, rr) and
+                all(abs(rr - c[2]) > max(10, 0.1 * rr) or
+                    (rx - c[0]) ** 2 + (ry - c[1]) ** 2 > (0.2 * rr) ** 2
+                    for c in detected_circles)):
                 extra_rings.append((rx, ry, rr))
 
     # Total circle count = clean circles (used for nodes) + extra rings.
@@ -1425,6 +1554,12 @@ def detect_grid_patterns_robust(img, prune_length=4):
                     continue
             split_nodes.append((cx, cy, nt))
         all_nodes = split_nodes
+
+    # Add genuine degree-2 corners (sharp bends) not already captured.
+    _existing_pts = [(p[0], p[1]) for p in all_nodes]
+    all_nodes = all_nodes + detect_corner_nodes(
+        skeleton, _existing_pts, circles=detected_circles,
+        circle_tol=max(10, img_diag // 70), min_dist=max(20, img_diag // 45))
 
     output_img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
     pattern_counts = {2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0, 8: 0, 9: 0, 10: 0, 11: 0, 12: 0, "other": 0}
@@ -1819,7 +1954,8 @@ def detect_grid_patterns_robust(img, prune_length=4):
         elif node_type in ('through', 'xcross', 'circ6'):
             use_square = True
         elif node_type == 'corner':
-            use_square = False           # collapsed corner cluster -> circle
+            # collapsed cluster: square iff a straight line really passes through
+            use_square = has_straight_chord(scx, scy, arms)
         elif node_type == 'vertex':
             if on_circle_perimeter or on_any_circle:
                 use_square = False
