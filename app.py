@@ -35,5 +35,11 @@ if uploaded_file is not None:
         nonzero = {f"Degree {k}": v for k, v in result["pattern_counts"].items() if v}
         st.json(nonzero)
         
+        # Display the node shapes found
+        st.write("**Node Shapes Found:**")
+        shapes = dict(sorted(result.get("shape_counts", {}).items(),
+                             key=lambda kv: -kv[1]))
+        st.json(shapes)
+        
     else:
         st.warning("No patterns detected in the image.")

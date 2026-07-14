@@ -1421,6 +1421,187 @@ def detect_corner_nodes(skeleton, existing, circles=None, circle_tol=12,
     return found
 
 
+def _snap_angle(a, allowed):
+    return min(allowed, key=lambda x: abs(x - a))
+
+def _afmt(a):
+    return ("%g" % a)
+
+# allowed angles per category (from the junction-types taxonomy)
+_ANGLE_SETS = {
+    "2-panel": [24, 45, 54, 57, 60, 72, 90, 96, 108, 116, 120, 126, 135, 144],
+    "3-claw":  [22.5, 27, 30, 36, 45, 54, 60, 67.5, 72, 90],
+    "3-Y":     [30, 40, 45, 53, 60, 71, 72, 84, 90, 108, 120, 127, 135],
+    "4-k":     [22.5, 27, 30, 32, 36, 45, 60, 63, 72],
+    "4-cirk":  [22.5, 30, 39.5, 45, 66],
+    "4-trid":  [22.5, 27, 30, 36, 45, 54, 60, 66, 67.5, 73.5],
+    "4-X":     [36, 45, 53, 60, 72, 75],
+}
+
+def classify_node_shape(dirs, straight, degree=None, on_circle=False, wedge_angs=None,
+                        marker_circle=False):
+    """Classify a junction into the taxonomy type name, e.g. '2-panel-90',
+    '3-panel-Y-120', '3-panel-claw-45', '4-panel-X-60', '4-panel-90',
+    '4-panel-k-45', '4-cir-k-45', '4-panel-trident-60', '8-panel-45'.
+    The angle is the smallest panel (gap between adjacent arms), snapped to
+    the allowed set for that shape."""
+    n = len(dirs)
+    if n == 0:
+        return "isolated"
+    if degree is None:
+        degree = n
+    curved = any(not s for s in straight)
+
+    # panels (gaps between adjacent arms). Prefer the same wedge angles that
+    # are displayed, so the shape label matches the on-image angles exactly.
+    if wedge_angs and len(wedge_angs) >= 2:
+        gaps = [float(g) for g in wedge_angs]
+    else:
+        angs = sorted(math.degrees(math.atan2(d[1], d[0])) % 360.0 for d in dirs)
+        gaps = [(angs[(i + 1) % n] - angs[i]) % 360.0 for i in range(n)]
+    if not gaps:
+        gaps = [360.0]
+    min_gap = min(gaps)
+    max_gap = max(gaps)
+
+    # number of opposite arm pairs ("through lines")
+    used = [False] * n
+    through = 0
+    for i in range(n):
+        if used[i]:
+            continue
+        for j in range(i + 1, n):
+            if used[j]:
+                continue
+            if dirs[i][0] * dirs[j][0] + dirs[i][1] * dirs[j][1] < -0.9:
+                through += 1
+                used[i] = used[j] = True
+                break
+
+    if on_circle:
+        if degree == 3:
+            if max_gap >= 200.0:
+                return "3-panel-claw-%s" % _afmt(_snap_angle(min_gap, _ANGLE_SETS["3-claw"]))
+            return "3e-arc"
+        if degree == 5:
+            # 5-crc-panel = a 3e/T element + a 2-panel wedge. The wedge is the
+            # two arms flanking the central spoke. Drop the widest gap (the arc
+            # gap / T straight line); the remaining panels form the inward fan
+            # between the two arc arms. The 2-panel opening = the sum of the two
+            # MIDDLE panels of that fan (the pair flanking the central spoke).
+            _a5 = sorted(math.degrees(math.atan2(d[1], d[0])) % 360.0 for d in dirs)
+            _n5 = len(_a5)
+            _cyc5 = [(_a5[(i + 1) % _n5] - _a5[i]) % 360.0 for i in range(_n5)]
+            _mi5 = _cyc5.index(max(_cyc5))
+            fan = _cyc5[_mi5 + 1:] + _cyc5[:_mi5]        # all gaps except the widest
+            if len(fan) >= 4:
+                base = fan[len(fan) // 2 - 1] + fan[len(fan) // 2]
+            elif len(fan) == 2:                          # degenerate (merged arms)
+                base = fan[0]
+            else:
+                base = max(fan) if fan else max_gap
+            a = _snap_angle(base, [57, 90, 120])
+            return "5-crc-panel-(3T+2panel%s)" % _afmt(a)
+
+    if n == 1:
+        return "endpoint"
+
+    if n == 2:
+        # opening = the angle between the two arms, taken from the arm
+        # DIRECTIONS themselves. Do not use wedge_angs/gaps[0] here: at boundary
+        # nodes compute_wedge_angles can carry spurious extra wedges, making
+        # gaps[0] meaningless (it split a clean 120 into e.g. 26+97).
+        dot = max(-1.0, min(1.0, dirs[0][0] * dirs[1][0] + dirs[0][1] * dirs[1][1]))
+        opening = math.degrees(math.acos(dot))
+        name = "2-panel-%s" % _afmt(_snap_angle(opening, _ANGLE_SETS["2-panel"]))
+        return name + " (arc)" if curved else name
+
+    if n == 3:
+        # A T-junction is a straight pass-through LINE (max panel ~180) plus a
+        # perpendicular branch, giving a ~90 panel. BOTH must hold: a right-angle
+        # panel alone is not enough (a Y like 135/135/90 also has a ~90 panel but
+        # has no straight line). Requiring the line (max_gap >= 150) also survives
+        # noise that distorts the collinear arm (e.g. 180/90/90 -> 211/90/59).
+        if max_gap >= 150.0 and any(abs(g - 90.0) < 8.0 for g in gaps):
+            return "3-panel-claw-90 (3-T)"
+        if curved:
+            if max_gap >= 200.0:          # bunched curved arms = claw
+                return "3-panel-claw-%s" % _afmt(_snap_angle(min_gap, _ANGLE_SETS["3-claw"]))
+            return "3e-arc"               # balanced curved 3-node
+        # claw = arms bunched, NO straight line through (widest panel > ~200)
+        if max_gap >= 200.0:
+            return "3-panel-claw-%s" % _afmt(_snap_angle(min_gap, _ANGLE_SETS["3-claw"]))
+        # straight line + slanted branch, or symmetric spread = Y
+        return "3-panel-Y-%s" % _afmt(_snap_angle(min_gap, _ANGLE_SETS["3-Y"]))
+
+    if n == 4:
+        if max_gap >= 150.0:
+            if curved or marker_circle:
+                # circle marker = a curved arc passes through, so this is the
+                # curved-k family (straight line + 2 arcs), never a polygon
+                # (3claw+1). Its name must carry the 'cir' arc tag.
+                return "4-cir-k-%s" % _afmt(_snap_angle(min_gap, _ANGLE_SETS["4-cirk"]))
+            if max_gap > 184.0:
+                # widest gap is not a straight line -> 3-claw + 1 separate arm
+                return "4-panel-(3claw%s+1)" % _afmt(_snap_angle(min_gap, _ANGLE_SETS["3-claw"]))
+            # A genuine straight line (~180) is present. Split the panel cycle
+            # at that line -> 3 remaining panels form the arc from one line-end
+            # to the other. k is symmetric (line + 2 arms mirrored about the
+            # perpendicular): those 3 panels read small-BIG-small, i.e. the
+            # MIDDLE panel is the largest (~90). (3claw+1) has 3 bunched arms +
+            # 1: the 3 panels read small-small-BIG, i.e. the largest is at an
+            # END (adjacent to the straight line).
+            asort = sorted(math.degrees(math.atan2(d[1], d[0])) % 360.0 for d in dirs)
+            cyc = [(asort[(i + 1) % n] - asort[i]) % 360.0 for i in range(n)]
+            im = cyc.index(max(cyc))
+            rest = [cyc[(im + 1 + k) % n] for k in range(n - 1)]  # 3 panels, linear
+            mid_is_max = abs(rest[len(rest) // 2] - max(rest)) < 8.0
+            if not mid_is_max:                      # asymmetric -> 3claw + 1
+                return "4-panel-(3claw%s+1)" % _afmt(_snap_angle(min_gap, _ANGLE_SETS["3-claw"]))
+            # a genuine straight line (~180) + two arms symmetric on one side = k
+            return "4-panel-k-%s" % _afmt(_snap_angle(min_gap, _ANGLE_SETS["4-k"]))
+        if through >= 2:                            # two lines crossing (no 180 panel)
+            if abs(min_gap - 90.0) < 12.0:
+                return "4-panel-90"
+            return "4-panel-X-%s" % _afmt(_snap_angle(min_gap, _ANGLE_SETS["4-X"]))
+        # spread arms (three prongs + a stem) = trident
+        return "4-panel-trident-%s" % _afmt(_snap_angle(min_gap, _ANGLE_SETS["4-trid"]))
+
+    if n == 5:
+        if curved:
+            return "5-cir-panel"
+        pd = sorted(gaps, reverse=True)                # [~180, ...]
+        a2 = _snap_angle(pd[1] + pd[2], [54, 60, 90, 108, 116, 120, 126, 135])
+        return "5-panel-(3T+2panel%s)" % _afmt(a2)
+    if n == 6:
+        # composite: an X/plus (two through lines = 4 arms) + a 2-panel corner
+        paired = [False] * n
+        xidx = []
+        for i in range(n):
+            if paired[i]:
+                continue
+            for j in range(i + 1, n):
+                if not paired[j] and \
+                        dirs[i][0] * dirs[j][0] + dirs[i][1] * dirs[j][1] < -0.985:
+                    paired[i] = paired[j] = True
+                    xidx += [i, j]
+                    break
+        corner = [i for i in range(n) if not paired[i]]
+        if len(xidx) >= 4 and len(corner) == 2:
+            xang = sorted(math.degrees(math.atan2(dirs[i][1], dirs[i][0])) % 360.0
+                          for i in xidx)
+            xgaps = [(xang[(k + 1) % len(xang)] - xang[k]) % 360.0
+                     for k in range(len(xang))]
+            a = _snap_angle(min(xgaps), [36, 45, 53, 60, 72, 75, 90])
+            cdot = max(-1.0, min(1.0, dirs[corner[0]][0] * dirs[corner[1]][0] +
+                                 dirs[corner[0]][1] * dirs[corner[1]][1]))
+            b = _snap_angle(math.degrees(math.acos(cdot)), [90, 108, 120, 135, 53])
+            return "6-panel-(4panel%s+2panel%s)" % (_afmt(a), _afmt(b))
+        return "6-panel-%s" % _afmt(360.0 / 6)
+    if n in (8, 12, 16):
+        return "%d-panel-%s" % (n, _afmt(360.0 / n))   # regular star: 360/n
+    return "%d-panel-%d" % (n, int(round(min_gap)))
+
 def detect_grid_patterns_robust(img, prune_length=4):
     if img is None:
         return None
@@ -1673,10 +1854,50 @@ def detect_grid_patterns_robust(img, prune_length=4):
                 path.append(best)
             if len(path) >= 3:
                 er, ec = path[-1]
-                dx = ec - cx
-                dy = er - cy
+                ox, oy = ec - cx, er - cy            # outward reference
+                if len(path) >= 5:
+                    ppts = np.asarray([[c, r] for r, c in path], dtype=np.float64)
+                    ppts -= ppts.mean(0)
+                    try:
+                        _, _, vt = np.linalg.svd(ppts, full_matrices=False)
+                        pdir = vt[0]                  # best-fit line direction
+                        if pdir[0] * ox + pdir[1] * oy < 0:
+                            pdir = -pdir
+                        dx, dy = float(pdir[0]), float(pdir[1])
+                    except np.linalg.LinAlgError:
+                        dx, dy = ox, oy
+                else:
+                    dx, dy = ox, oy
+                # Sub-pixel refinement: walk the arm and find the darkness-
+                # weighted centre of the stroke across its width (perpendicular
+                # to the current direction). Averaging the anti-aliased stroke
+                # removes skeleton staircase noise -> tighter angles. On thin
+                # crisp lines the centre already equals the skeleton, so this is
+                # a no-op there (safe).
+                nnx, nny = -dy, dx
+                sub = []
+                for (pr, pc) in path[2:]:
+                    num = den = 0.0
+                    for tt in (-3, -2, -1, 0, 1, 2, 3):
+                        sx = int(round(pc + nnx * tt)); sy = int(round(pr + nny * tt))
+                        if 0 <= sy < h and 0 <= sx < w:
+                            wv = 255.0 - float(img[sy, sx])
+                            num += tt * wv; den += wv
+                    if den > 0:
+                        off = num / den
+                        sub.append((pc + nnx * off, pr + nny * off))
+                if len(sub) >= 5:
+                    sp = np.asarray(sub, dtype=np.float64); sp -= sp.mean(0)
+                    try:
+                        _, _, vt2 = np.linalg.svd(sp, full_matrices=False)
+                        p2 = vt2[0]
+                        if p2[0] * ox + p2[1] * oy < 0:
+                            p2 = -p2
+                        dx, dy = float(p2[0]), float(p2[1])
+                    except np.linalg.LinAlgError:
+                        pass
                 norm = math.hypot(dx, dy)
-                if norm > 1:
+                if norm > 1e-6:
                     arms.append(((dx / norm, dy / norm), path))
         return arms
 
@@ -1826,18 +2047,24 @@ def detect_grid_patterns_robust(img, prune_length=4):
         traced = get_arm_directions(trace_cy, trace_cx)
         traced_dirs = [a[0] for a in traced]
 
-        if corner_dirs is not None:
-            merged = list(corner_dirs)
-            min_sep_cos = math.cos(math.radians(20))
+        if corner_dirs is not None and traced_dirs:
+            # Refine each TRACED arm to a nearby corner (polygon-edge) direction
+            # when one aligns, but never ADD a corner direction that matches no
+            # traced arm. Adding unmatched corner dirs inflated 2-arm boundary
+            # nodes (e.g. a honeycomb vertex whose "adjacent shape corners" are
+            # far away) into 3-4 spurious wedges like 27/24/96.
+            min_sep_cos = math.cos(math.radians(25))
+            refined = []
             for td in traced_dirs:
-                is_new = True
-                for md in merged:
-                    if td[0] * md[0] + td[1] * md[1] > min_sep_cos:
-                        is_new = False
-                        break
-                if is_new:
-                    merged.append(td)
-            return _wedges_from_dirs(merged)
+                pick = td
+                best_c = min_sep_cos
+                for cd in corner_dirs:
+                    c = td[0] * cd[0] + td[1] * cd[1]
+                    if c > best_c:
+                        best_c = c
+                        pick = cd
+                refined.append(pick)
+            return _wedges_from_dirs(refined)
 
         return _wedges_from_dirs(traced_dirs)
 
@@ -1873,7 +2100,8 @@ def detect_grid_patterns_robust(img, prune_length=4):
             cv2.putText(img_out, text, org, font, scale, (0, 0, 0),
                         thickness, cv2.LINE_AA)
 
-    node_records = [] 
+    node_records = []
+    shape_counts = {}
 
     circle_geom = None
     if shape_type == "Circle":
@@ -1970,6 +2198,58 @@ def detect_grid_patterns_robust(img, prune_length=4):
 
         wedges = compute_wedge_angles(cx, cy, is_shape_vertex)
 
+        _lens_ang = None
+        if is_lens:
+            # Two tangent circles meeting: 4 arcs that are nearly collinear (the
+            # circles only TOUCH, they don't cross). Recover the 4 real arc
+            # directions by sampling each circle a marker-radius out on both
+            # sides, then show the genuine panels (two large gaps + two tiny
+            # splays) and label with the real small gap.
+            _lc = [(ccx, ccy, rr) for (ccx, ccy, rr) in detected_circles
+                   if abs(math.hypot(cx - ccx, cy - ccy) - rr) < _lens_tol]
+            if len(_lc) >= 2:
+                _lc.sort(key=lambda c: c[2])
+                _ld = []
+                for (ccx, ccy, rr) in (_lc[0], _lc[-1]):
+                    rlen = math.hypot(cx - ccx, cy - ccy) or 1.0
+                    rxu, ryu = (cx - ccx) / rlen, (cy - ccy) / rlen   # outward radial
+                    txu, tyu = -ryu, rxu                              # tangent
+                    dlt = marker_radius / rr                          # curvature tilt
+                    cd, sd = math.cos(dlt), math.sin(dlt)
+                    # both arcs of this circle lean toward its centre (-radial),
+                    # so all 4 arcs lean inward and the OUTER gap is the wider one
+                    _ld.append((cd * txu - sd * rxu, cd * tyu - sd * ryu))
+                    _ld.append((-cd * txu - sd * rxu, -cd * tyu - sd * ryu))
+                wedges = _wedges_from_dirs(_ld)
+                _sm = sorted(w[0] for w in wedges)[:2]   # the two splay panels
+                _lens_ang = sum(_sm) / len(_sm) if _sm else None
+        elif (_on_circ >= 1 and degree == 3
+              and node_type not in ('ring3', 'pcross4', 'xcross', 'circ6')):
+            # 3e-arc node: two of its arms are the same circle's arcs. Their
+            # traced direction is a CHORD over a long arc (wrong on small
+            # circles), so rebuild the wedges from the TANGENT at the node for
+            # arms that run along a detected circle -> the two arcs read as
+            # ~collinear (e.g. a spoke at the top of a circle: 180/90/90).
+            _td = []
+            _ctol = max(6, img_diag // 110)
+            for (_dir, _path) in arms:
+                _fx = _dir
+                for (ccx, ccy, rr) in detected_circles:
+                    if _path and sum(1 for (pr, pc) in _path
+                                     if abs(math.hypot(pc - ccx, pr - ccy) - rr)
+                                     < _ctol) >= 0.7 * len(_path):
+                        _rx, _ry = scx - ccx, scy - ccy
+                        _tx, _ty = -_ry, _rx
+                        if _tx * _dir[0] + _ty * _dir[1] < 0:
+                            _tx, _ty = -_tx, -_ty
+                        _n = math.hypot(_tx, _ty)
+                        if _n > 1e-6:
+                            _fx = (_tx / _n, _ty / _n)
+                        break
+                _td.append(_fx)
+            if len(_td) >= 2:
+                wedges = _wedges_from_dirs(_td)
+
         if degree in DEGREE_COLORS:
             pattern_counts[degree] += 1
             draw_marker(output_img, cx, cy, marker_radius,
@@ -1981,11 +2261,39 @@ def detect_grid_patterns_robust(img, prune_length=4):
                         use_square)
 
         draw_wedge_labels(output_img, cx, cy, wedges, marker_radius)
+
+        # Classify the node's geometric shape (X, +, T, Y, curved X, ...).
+        if node_type == 'circ6':
+            shape = "6-cir-panel"
+        elif node_type == 'pcross4':
+            # A straight spoke crossing a petal = a degree-4 trident (square
+            # marker). Arm tracing over-segments the tangent petal into an extra
+            # arm, so drop the widest gap (the petal reflex) and the tiniest
+            # over-segmentation gaps; the trident angle is the min of the two
+            # remaining larger panels.
+            _pw = sorted((w[0] for w in wedges), reverse=True)
+            _mid = _pw[1:3] if len(_pw) >= 3 else _pw[1:]
+            _ang = min(_mid) if _mid else (min(_pw) if _pw else 45.0)
+            shape = "4-panel-trident-%s" % _afmt(_snap_angle(_ang, _ANGLE_SETS["4-trid"]))
+        elif node_type == 'ring3':
+            shape = "3e-arc"
+        elif is_lens:
+            shape = "4-cir-k-%s" % _afmt(max(1, round(_lens_ang)) if _lens_ang is not None else 45)
+        else:
+            _adirs = [a[0] for a in arms]
+            _astr = [arm_is_straight(a[1], scy, scx) for a in arms]
+            shape = classify_node_shape(
+                _adirs, _astr, degree, on_circle=(_on_circ >= 1),
+                wedge_angs=[w[0] for w in wedges],
+                marker_circle=(not use_square))
+        shape_counts[shape] = shape_counts.get(shape, 0) + 1
+
         node_records.append({
             "x": int(cx),
             "y": int(cy),
             "degree": degree,
             "marker": "square" if use_square else "circle",
+            "shape": shape,
             "angles_deg": [round(float(w[0]), 1) for w in wedges],
         })
 
@@ -1995,6 +2303,7 @@ def detect_grid_patterns_robust(img, prune_length=4):
         "pattern_counts": pattern_counts,
         "nodes": node_records,
         "circle_count": total_circles_found,
+        "shape_counts": shape_counts,
     }
 
 
@@ -2054,6 +2363,10 @@ if __name__ == "__main__":
     for k, v in result["pattern_counts"].items():
         if v > 0: 
             print(f"  Degree {k}: {v}")
+
+    print("\nNODE SHAPES FOUND:")
+    for shp, v in sorted(result["shape_counts"].items(), key=lambda kv: -kv[1]):
+        print(f"  {shp}: {v}")
 
     # Simplified matplotlib window title
     plt.figure(figsize=(12, 8))
