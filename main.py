@@ -3,20 +3,24 @@ import numpy as np
 import matplotlib.pyplot as plt
 from skimage.morphology import skeletonize
 import math
+import hashlib
 
-DEGREE_COLORS = {
-    2:  (200, 0, 200),    # purple
-    3:  (0, 0, 255),      # red
-    4:  (255, 0, 0),      # blue
-    5:  (0, 165, 255),    # orange
-    6:  (0, 255, 0),      # green
-    7:  (255, 255, 0),    # cyan
-    8:  (0, 255, 255),    # yellow
-    9:  (255, 0, 255),    # magenta
-    10: (128, 255, 0),    # spring green
-    11: (255, 128, 0),    # azure
-    12: (0, 128, 255),    # amber
-}
+def assign_shape_colors(names):
+    """Give every distinct shape name its own DISTINCT colour by spreading hues
+    evenly across all shapes present (max separation). Names are sorted first so
+    the same set of shapes always yields the same colours. Variants like
+    '4-cir-k-30' and '4-cir-k-45' are separate names -> separate colours."""
+    _uniq = sorted(set(names))
+    _n = max(1, len(_uniq))
+    _out = {}
+    for _i, _nm in enumerate(_uniq):
+        _hue = int(180.0 * _i / _n)                       # 0..179 evenly spaced
+        _sat = 235 if _i % 2 == 0 else 200                # alternate to separate
+        _val = 255 if _i % 3 else 215                     #   neighbouring hues
+        _hsv = np.uint8([[[_hue, _sat, _val]]])
+        _b = cv2.cvtColor(_hsv, cv2.COLOR_HSV2BGR)[0][0]
+        _out[_nm] = (int(_b[0]), int(_b[1]), int(_b[2]))
+    return _out
 
 #preprocessing
 
@@ -135,65 +139,6 @@ def prune_dead_end_branches(skeleton, max_dead_end_length=25):
                 changed = True
 
     return skel.astype(np.uint8)
-
-def is_straight_line(skeleton, r, c, radius=6):
-    h, w = skeleton.shape
-    points = []
-    for dr in range(-radius, radius + 1):
-        for dc in range(-radius, radius + 1):
-            rr, cc = r + dr, c + dc
-            if 0 <= rr < h and 0 <= cc < w and skeleton[rr, cc]:
-                points.append([dc, dr])
-    if len(points) < 5:
-        return True
-
-    pts = np.array(points, dtype=np.float32)
-    pts -= np.mean(pts, axis=0)
-    cov = np.cov(pts.T)
-    eigvals, _ = np.linalg.eig(cov)
-    min_eigval = min(eigvals)
-    if min_eigval < 1e-6:
-        return True
-    return max(eigvals) / min_eigval > 15
-
-def count_branches_robust(skeleton_img, center_r, center_c, radius=15):
-    height, width = skeleton_img.shape
-    r_start = max(0, center_r - radius)
-    r_end = min(height, center_r + radius + 1)
-    c_start = max(0, center_c - radius)
-    c_end = min(width, center_c + radius + 1)
-
-    window = skeleton_img[r_start:r_end, c_start:c_end]
-    if window.shape[0] < 3 or window.shape[1] < 3:
-        return 0
-
-    top = window[0, :]
-    bottom = window[-1, :][::-1]
-    if window.shape[0] > 1:
-        right = window[1:-1, -1]
-        left = window[1:-1, 0][::-1]
-    else:
-        right = np.array([], dtype=window.dtype)
-        left = np.array([], dtype=window.dtype)
-
-    perimeter = np.concatenate([top, right, bottom, left])
-
-    transitions = 0
-    is_on_line = False
-    for v in perimeter:
-        if v > 0:
-            if not is_on_line:
-                transitions += 1
-                is_on_line = True
-        else:
-            is_on_line = False
-
-    if perimeter[0] > 0 and perimeter[-1] > 0:
-        transitions -= 1
-    return transitions
-
-def count_branches_standard(skeleton_img, center_r, center_c, radius=10):
-    return count_branches_robust(skeleton_img, center_r, center_c, radius=radius)
 
 def get_refined_shape(cnt):
     area = cv2.contourArea(cnt)
@@ -330,102 +275,6 @@ def detect_all_circles(binary, min_radius_px=10):
         if keep:
             dedup.append((cx, cy, r))
     return dedup
-
-def _merge_tangent_bridge_pairs(points, skeleton, max_dist):
-    n = len(points)
-    if n == 0:
-        return []
-    parent = list(range(n))
-
-    def find(a):
-        while parent[a] != a:
-            parent[a] = parent[parent[a]]
-            a = parent[a]
-        return a
-
-    def union(a, b):
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[rb] = ra
-
-    def snap(x, y):
-        H, W = skeleton.shape
-        for radius in (0, 2, 4, 6, 8):
-            for dr in range(-radius, radius + 1):
-                for dc in range(-radius, radius + 1):
-                    if dr * dr + dc * dc > radius * radius:
-                        continue
-                    rr, cc = y + dr, x + dc
-                    if 0 <= rr < H and 0 <= cc < W and skeleton[rr, cc]:
-                        return rr, cc
-        return None
-
-    H, W = skeleton.shape
-    block_dist = 6 
-    snapped = [snap(p[0], p[1]) for p in points]
-
-    def path_exists(i, j, limit):
-        from collections import deque
-        src = snapped[i]; dst = snapped[j]
-        if src is None or dst is None:
-            return False
-        if src == dst:
-            return True
-        forbidden = set()
-        for k in range(n):
-            if k == i or k == j:
-                continue
-            xk, yk = points[k]
-            for dr in range(-block_dist, block_dist + 1):
-                for dc in range(-block_dist, block_dist + 1):
-                    if dr * dr + dc * dc > block_dist * block_dist:
-                        continue
-                    rr, cc = yk + dr, xk + dc
-                    forbidden.add((rr, cc))
-        q = deque([(src[0], src[1], 0)])
-        seen = {src}
-        while q:
-            r, c, d = q.popleft()
-            if d >= limit:
-                continue
-            for dr in (-1, 0, 1):
-                for dc in (-1, 0, 1):
-                    if dr == 0 and dc == 0:
-                        continue
-                    rr, cc = r + dr, c + dc
-                    if not (0 <= rr < H and 0 <= cc < W):
-                        continue
-                    if not skeleton[rr, cc]:
-                        continue
-                    if (rr, cc) in seen:
-                        continue
-                    if (rr, cc) in forbidden:
-                        continue
-                    if (rr, cc) == dst:
-                        return True
-                    seen.add((rr, cc))
-                    q.append((rr, cc, d + 1))
-        return False
-
-    md2 = max_dist * max_dist
-    for i in range(n):
-        xi, yi = points[i]
-        for j in range(i + 1, n):
-            xj, yj = points[j]
-            if (xi - xj) ** 2 + (yi - yj) ** 2 > md2:
-                continue
-            if path_exists(i, j, max_dist + 4):
-                union(i, j)
-
-    groups = {}
-    for i in range(n):
-        groups.setdefault(find(i), []).append(points[i])
-    merged = []
-    for pts in groups.values():
-        mx = int(round(sum(p[0] for p in pts) / len(pts)))
-        my = int(round(sum(p[1] for p in pts) / len(pts)))
-        merged.append((mx, my, 'junction'))
-    return merged
 
 def _fit_circle_3pts(p1, p2, p3):
     ax, ay = p1
@@ -564,102 +413,6 @@ def is_on_any_circle(x, y, circles, tol):
         if abs(math.hypot(x - cx, y - cy) - r) < tol:
             return True
     return False
-
-def find_tangent_junctions(skeleton, img_diag):
-    neighbor_kernel = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]], dtype=np.uint8)
-    neighbors = cv2.filter2D(skeleton, -1, neighbor_kernel)
-    junction_pixels = np.where((neighbors >= 3) & (skeleton == 1), 255, 0).astype(np.uint8)
-    return junction_pixels
-
-def _merge_close_points(points, max_dist, node_type='junction'):
-    n = len(points)
-    if n == 0:
-        return []
-    parent = list(range(n))
-
-    def find(a):
-        while parent[a] != a:
-            parent[a] = parent[parent[a]]
-            a = parent[a]
-        return a
-
-    def union(a, b):
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[rb] = ra
-
-    md2 = max_dist * max_dist
-    for i in range(n):
-        xi, yi = points[i]
-        for j in range(i + 1, n):
-            xj, yj = points[j]
-            if (xi - xj) ** 2 + (yi - yj) ** 2 <= md2:
-                union(i, j)
-
-    groups = {}
-    for i in range(n):
-        groups.setdefault(find(i), []).append(points[i])
-
-    merged = []
-    for pts in groups.values():
-        mx = int(round(sum(p[0] for p in pts) / len(pts)))
-        my = int(round(sum(p[1] for p in pts) / len(pts)))
-        merged.append((mx, my, node_type))
-    return merged
-
-def _merge_shared_circle_pairs(points, circles, circle_tol, max_dist):
-    n = len(points)
-    if n == 0 or not circles:
-        return list(points)
-
-    def memberships(x, y):
-        s = set()
-        for ci, (cx, cy, r) in enumerate(circles):
-            if abs(math.hypot(x - cx, y - cy) - r) < circle_tol:
-                s.add(ci)
-        return s
-
-    mem = [memberships(p[0], p[1]) for p in points]
-
-    parent = list(range(n))
-
-    def find(a):
-        while parent[a] != a:
-            parent[a] = parent[parent[a]]
-            a = parent[a]
-        return a
-
-    def union(a, b):
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[rb] = ra
-
-    md2 = max_dist * max_dist
-    for i in range(n):
-        if not mem[i]:
-            continue
-        xi, yi = points[i][0], points[i][1]
-        for j in range(i + 1, n):
-            if not mem[j]:
-                continue
-            xj, yj = points[j][0], points[j][1]
-            if (xi - xj) ** 2 + (yi - yj) ** 2 > md2:
-                continue
-            if len(mem[i] & mem[j]) >= 2:
-                union(i, j)
-
-    groups = {}
-    for i in range(n):
-        groups.setdefault(find(i), []).append(i)
-
-    merged = []
-    for idxs in groups.values():
-        pts = [points[i] for i in idxs]
-        mx = int(round(sum(p[0] for p in pts) / len(pts)))
-        my = int(round(sum(p[1] for p in pts) / len(pts)))
-        nt = pts[0][2] if len(pts[0]) > 2 else 'junction'
-        merged.append((mx, my, nt))
-    return merged
 
 def snap_to_skeleton(skeleton, r, c, R):
     if 0 <= r < skeleton.shape[0] and 0 <= c < skeleton.shape[1] and skeleton[r, c]:
@@ -912,36 +665,6 @@ def _is_real_corner(skel, vx, vy):
     d1, d2 = arms[0][0], arms[1][0]
     dot = d1[0] * d2[0] + d1[1] * d2[1]
     return dot > -0.95                            # a real bend, not a straight line
-
-
-def _split_through_by_circles(atoms, idxs, circles, tol):
-    """If a straight-through cluster crosses TWO OR MORE distinct circles,
-    return one 'through' node per circle (the pure spoke-circle crossing).
-    A cluster sitting on a single circle (tangent edge-midpoint) returns
-    None so it stays a single node."""
-    if not circles:
-        return None
-    mem = {}
-    for k in idxs:
-        x, y = atoms[k]
-        mem[k] = {ci for ci, (cx, cy, r) in enumerate(circles)
-                  if abs(math.hypot(x - cx, y - cy) - r) < tol}
-    distinct = set().union(*mem.values()) if mem else set()
-    if len(distinct) < 2:
-        return None
-    picks = []
-    for ci in distinct:
-        cands = [k for k in idxs if ci in mem[k]]
-        if not cands:
-            continue
-        # the purest crossing of this circle = on the fewest circles
-        best = min(cands, key=lambda k: len(mem[k]))
-        picks.append(atoms[best])
-    out = []
-    for (x, y) in picks:
-        if all((x - ox) ** 2 + (y - oy) ** 2 >= 15 * 15 for ox, oy, _ in out):
-            out.append((x, y, 'through'))
-    return out if len(out) >= 2 else None
 
 
 def refine_junction_nodes(skeleton, max_link_dist=60, circles=None, circle_tol=12):
@@ -1341,16 +1064,6 @@ def _circle_coverage(dt, H, W, cx, cy, r, tol, samples=720):
             hit += 1
     return hit / samples
 
-def _is_real_circle(dt, H, W, cx, cy, r):
-    """Curvature-based test. A real circle's skeleton lies ON it: most of the
-    circumference is covered at a tight tolerance, and loosening the tolerance
-    barely adds coverage (gaps are genuine absences). A polygon outline or a
-    circle fitted through scattered intersections only matches at a loose
-    tolerance, so its coverage JUMPS when the tolerance grows."""
-    c5 = _circle_coverage(dt, H, W, cx, cy, r, 5)
-    c12 = _circle_coverage(dt, H, W, cx, cy, r, 12)
-    return c5 >= 0.60 and (c12 - c5) <= 0.08
-
 def filter_real_circles(skeleton, circles, cov_thresh=0.95, **_):
     """Strict filter for circles used in NODE logic: keep only nearly fully
     covered circles (clean drawn circles). Partial big rings are handled
@@ -1482,7 +1195,13 @@ def classify_node_shape(dirs, straight, degree=None, on_circle=False, wedge_angs
         if degree == 3:
             if max_gap >= 200.0:
                 return "3-panel-claw-%s" % _afmt(_snap_angle(min_gap, _ANGLE_SETS["3-claw"]))
-            return "3e-arc"
+            # The arc is the ~180 panel; the spoke splits the remaining ~180.
+            # Equal halves (90/90) = spoke perpendicular to the arc -> 3e-arc;
+            # unequal halves (e.g. 120/60) = spoke slanted -> 3f-arc.
+            _rest = sorted(gaps)[:2]        # the two spoke-side panels
+            if len(_rest) == 2 and abs(_rest[0] - _rest[1]) < 20.0:
+                return "3e-arc"
+            return "3f-arc"
         if degree == 5:
             # 5-crc-panel = a 3e/T element + a 2-panel wedge. The wedge is the
             # two arms flanking the central spoke. Drop the widest gap (the arc
@@ -1537,6 +1256,14 @@ def classify_node_shape(dirs, straight, degree=None, on_circle=False, wedge_angs
     if n == 4:
         if max_gap >= 150.0:
             if curved or marker_circle:
+                if through >= 2:
+                    # two circles CROSSING (each passes through -> 2 through
+                    # lines). Treating the arcs as straight lines makes an X.
+                    _xs = sorted(gaps)[:2]
+                    _xa = sum(_xs) / len(_xs) if _xs else min_gap
+                    if abs(_xa - 90.0) < 12.0:
+                        return "4-panel-90"
+                    return "4-panel-X-%s" % _afmt(round(_xa))
                 # circle marker = a curved arc passes through, so this is the
                 # curved-k family (straight line + 2 arcs), never a polygon
                 # (3claw+1). Its name must carry the 'cir' arc tag.
@@ -1563,6 +1290,10 @@ def classify_node_shape(dirs, straight, degree=None, on_circle=False, wedge_angs
         if through >= 2:                            # two lines crossing (no 180 panel)
             if abs(min_gap - 90.0) < 12.0:
                 return "4-panel-90"
+            # two straight lines crossing = an X (panels alternate small/large,
+            # e.g. 60/120/60/120). Always the X element, labelled by its small
+            # panel. (The '4-panel-(2panel120+2panel60)' element is a DIFFERENT,
+            # non-crossing shape and is not produced here.)
             return "4-panel-X-%s" % _afmt(_snap_angle(min_gap, _ANGLE_SETS["4-X"]))
         # spread arms (three prongs + a stem) = trident
         return "4-panel-trident-%s" % _afmt(_snap_angle(min_gap, _ANGLE_SETS["4-trid"]))
@@ -1597,8 +1328,37 @@ def classify_node_shape(dirs, straight, degree=None, on_circle=False, wedge_angs
                                  dirs[corner[0]][1] * dirs[corner[1]][1]))
             b = _snap_angle(math.degrees(math.acos(cdot)), [90, 108, 120, 135, 53])
             return "6-panel-(4panel%s+2panel%s)" % (_afmt(a), _afmt(b))
+        # Three straight lines through the node with panels [a,a,2a,a,a,2a]
+        # (four small + two = 2x small) = two overlapping k-shape elements
+        # -> 6-panel-(2*k-a).
+        _c6 = sorted(math.degrees(math.atan2(d[1], d[0])) % 360.0 for d in dirs)
+        _cg6 = sorted((_c6[(i + 1) % 6] - _c6[i]) % 360.0 for i in range(6))
+        _a6 = sum(_cg6[:4]) / 4.0
+        _b6 = sum(_cg6[4:]) / 2.0
+        if (max(abs(x - _a6) for x in _cg6[:4]) < 12.0
+                and max(abs(x - _b6) for x in _cg6[4:]) < 12.0
+                and abs(_b6 - 2.0 * _a6) < 15.0):
+            return "6-panel-(2*k-%s)" % _afmt(
+                _snap_angle(_a6, [22.5, 27, 30, 36, 45, 60, 63, 72]))
         return "6-panel-%s" % _afmt(360.0 / 6)
-    if n in (8, 12, 16):
+    if n == 8:
+        # cyclic panels. Alternating two values (e.g. 30/60) = two overlapping
+        # 4-panel-(2panelX+2panelY) elements, where the sub-element angles are
+        # TWICE the two panel values. Even panels give a regular 8-star.
+        asort = sorted(math.degrees(math.atan2(d[1], d[0])) % 360.0 for d in dirs)
+        cg = [(asort[(i + 1) % 8] - asort[i]) % 360.0 for i in range(8)]
+        _ev, _od = cg[0::2], cg[1::2]
+        _me = sum(_ev) / len(_ev)
+        _mo = sum(_od) / len(_od)
+        if (max(abs(x - _me) for x in _ev) < 12.0
+                and max(abs(x - _mo) for x in _od) < 12.0
+                and abs(_me - _mo) > 12.0):
+            _hi = round(2.0 * max(_me, _mo))
+            _lo = round(2.0 * min(_me, _mo))
+            return ("8-panel-(2*(4-panel-(2panel%s+2panel%s)))"
+                    % (_afmt(_hi), _afmt(_lo)))
+        return "8-panel-%s" % _afmt(360.0 / 8)
+    if n in (12, 16):
         return "%d-panel-%s" % (n, _afmt(360.0 / n))   # regular star: 360/n
     return "%d-panel-%d" % (n, int(round(min_gap)))
 
@@ -2199,6 +1959,7 @@ def detect_grid_patterns_robust(img, prune_length=4):
         wedges = compute_wedge_angles(cx, cy, is_shape_vertex)
 
         _lens_ang = None
+        _lens_cross = False
         if is_lens:
             # Two tangent circles meeting: 4 arcs that are nearly collinear (the
             # circles only TOUCH, they don't cross). Recover the 4 real arc
@@ -2209,6 +1970,15 @@ def detect_grid_patterns_robust(img, prune_length=4):
                    if abs(math.hypot(cx - ccx, cy - ccy) - rr) < _lens_tol]
             if len(_lc) >= 2:
                 _lc.sort(key=lambda c: c[2])
+                (_c1x, _c1y, _r1), (_c2x, _c2y, _r2) = _lc[0], _lc[-1]
+                # Angle at which the two circles meet, from the intersection-angle
+                # formula cos = (r1^2 + r2^2 - d^2)/(2 r1 r2). Tangent circles give
+                # 0; circles that CROSS give a real angle (the crossing angle).
+                _cdd = math.hypot(_c1x - _c2x, _c1y - _c2y)
+                _cosr = ((_r1 * _r1 + _r2 * _r2 - _cdd * _cdd)
+                         / (2 * _r1 * _r2) if _r1 > 0 and _r2 > 0 else 1.0)
+                _ang_r = math.degrees(math.acos(max(-1.0, min(1.0, _cosr))))
+                _ac_r = min(_ang_r, 180.0 - _ang_r)
                 _ld = []
                 for (ccx, ccy, rr) in (_lc[0], _lc[-1]):
                     rlen = math.hypot(cx - ccx, cy - ccy) or 1.0
@@ -2223,6 +1993,10 @@ def detect_grid_patterns_robust(img, prune_length=4):
                 wedges = _wedges_from_dirs(_ld)
                 _sm = sorted(w[0] for w in wedges)[:2]   # the two splay panels
                 _lens_ang = sum(_sm) / len(_sm) if _sm else None
+                # a genuine CROSSING: both a real intersection angle and a panel
+                # gap clearly above the tiny tangent splay
+                _lens_cross = (_ac_r > 8.0 and _lens_ang is not None
+                               and _lens_ang > 20.0)
         elif (_on_circ >= 1 and degree == 3
               and node_type not in ('ring3', 'pcross4', 'xcross', 'circ6')):
             # 3e-arc node: two of its arms are the same circle's arcs. Their
@@ -2249,16 +2023,66 @@ def detect_grid_patterns_robust(img, prune_length=4):
                 _td.append(_fx)
             if len(_td) >= 2:
                 wedges = _wedges_from_dirs(_td)
+        elif (degree == 4 and not is_lens and use_square
+              and node_type not in ('circ6', 'pcross4')):
+            # A straight line crossing a circle. The spoke is the most-opposite
+            # pair of arms (the through-line); the other two arms are the arcs.
+            # Treat the arcs as straight lines (circle tangent): if that makes a
+            # perpendicular '+', it is 4-panel-90. Oblique crossings keep their
+            # original (trident/X) reading.
+            _nn = len(arms)
+            _best = (1.0, -1, -1)
+            for _i in range(_nn):
+                for _j in range(_i + 1, _nn):
+                    _dd = (arms[_i][0][0] * arms[_j][0][0]
+                           + arms[_i][0][1] * arms[_j][0][1])
+                    if _dd < _best[0]:
+                        _best = (_dd, _i, _j)
+            _arc = [k for k in range(_nn) if k not in (_best[1], _best[2])]
+            if (_best[0] < -0.9 and len(_arc) == 2
+                    and all(arms[k][1] and _arm_follows_circle(arms[k][1])
+                            for k in _arc)):
+                _cc = max(6, img_diag // 110)
+                _nd = [a[0] for a in arms]
+                for _k in _arc:
+                    _p = arms[_k][1]; _d = arms[_k][0]
+                    for (ccx, ccy, rr) in detected_circles:
+                        if sum(1 for (pr, pc) in _p
+                               if abs(math.hypot(pc - ccx, pr - ccy) - rr)
+                               < _cc) >= 0.6 * len(_p):
+                            _tx, _ty = -(scy - ccy), (scx - ccx)
+                            if _tx * _d[0] + _ty * _d[1] < 0:
+                                _tx, _ty = -_tx, -_ty
+                            _n = math.hypot(_tx, _ty)
+                            if _n > 1e-6:
+                                _nd[_k] = (_tx / _n, _ty / _n)
+                            break
+                # Accept only if the straightened arc gives a perpendicular '+'
+                # (a radial spoke crossing a circle). Oblique crossings keep
+                # their original (trident/X) reading.
+                _w2 = _wedges_from_dirs(_nd)
+                if _w2 and abs(min(w[0] for w in _w2) - 90.0) < 15.0:
+                    arms = [(_nd[i], arms[i][1]) for i in range(len(arms))]
+                    wedges = _w2
+        elif node_type == 'pcross4':
+            # A spoke crossing a petal, perpendicular: treat the arc as a straight
+            # line and show a clean '+' from the spoke direction -> 4-panel-90.
+            _sp = None
+            for (_d, _p) in arms:
+                if arm_is_straight(_p, scy, scx) and not _arm_follows_circle(_p):
+                    _sp = _d
+                    break
+            if _sp is None and arms:
+                _sp = arms[0][0]
+            if _sp is not None:
+                _pxx, _pyy = -_sp[1], _sp[0]
+                wedges = _wedges_from_dirs(
+                    [_sp, (-_sp[0], -_sp[1]), (_pxx, _pyy), (-_pxx, -_pyy)])
 
-        if degree in DEGREE_COLORS:
+        if 2 <= degree <= 12:
             pattern_counts[degree] += 1
-            draw_marker(output_img, cx, cy, marker_radius,
-                        DEGREE_COLORS[degree], marker_thickness, use_square)
         else:
             pattern_counts["other"] += 1
-            draw_marker(output_img, cx, cy, max(4, marker_radius // 2),
-                        (128, 128, 128), max(1, marker_thickness // 2),
-                        use_square)
 
         draw_wedge_labels(output_img, cx, cy, wedges, marker_radius)
 
@@ -2266,19 +2090,16 @@ def detect_grid_patterns_robust(img, prune_length=4):
         if node_type == 'circ6':
             shape = "6-cir-panel"
         elif node_type == 'pcross4':
-            # A straight spoke crossing a petal = a degree-4 trident (square
-            # marker). Arm tracing over-segments the tangent petal into an extra
-            # arm, so drop the widest gap (the petal reflex) and the tiniest
-            # over-segmentation gaps; the trident angle is the min of the two
-            # remaining larger panels.
-            _pw = sorted((w[0] for w in wedges), reverse=True)
-            _mid = _pw[1:3] if len(_pw) >= 3 else _pw[1:]
-            _ang = min(_mid) if _mid else (min(_pw) if _pw else 45.0)
-            shape = "4-panel-trident-%s" % _afmt(_snap_angle(_ang, _ANGLE_SETS["4-trid"]))
+            # A straight spoke crossing a petal, perpendicular: the arc as a
+            # straight line makes a '+' -> 4-panel-90 (wedges already rebuilt).
+            shape = "4-panel-90"
         elif node_type == 'ring3':
             shape = "3e-arc"
         elif is_lens:
-            shape = "4-cir-k-%s" % _afmt(max(1, round(_lens_ang)) if _lens_ang is not None else 45)
+            if _lens_cross:
+                shape = "4-panel-X"
+            else:
+                shape = "4-cir-k-%s" % _afmt(max(1, round(_lens_ang)) if _lens_ang is not None else 45)
         else:
             _adirs = [a[0] for a in arms]
             _astr = [arm_is_straight(a[1], scy, scx) for a in arms]
@@ -2286,6 +2107,13 @@ def detect_grid_patterns_robust(img, prune_length=4):
                 _adirs, _astr, degree, on_circle=(_on_circ >= 1),
                 wedge_angs=[w[0] for w in wedges],
                 marker_circle=(not use_square))
+        # A 3-T element has a straight line passing straight through it (the
+        # crossbar), so it is always a SQUARE marker. At grid-boundary nodes the
+        # arm tracer can miss the through-line, so key this off the (reliable)
+        # shape label instead.
+        if shape.startswith("3-panel-claw-90"):
+            use_square = True
+
         shape_counts[shape] = shape_counts.get(shape, 0) + 1
 
         node_records.append({
@@ -2297,6 +2125,38 @@ def detect_grid_patterns_robust(img, prune_length=4):
             "angles_deg": [round(float(w[0]), 1) for w in wedges],
         })
 
+    # ---- colour every marker by its SHAPE type + draw a legend ----
+    shape_colors = assign_shape_colors(shape_counts.keys())
+    for _rec in node_records:
+        _deg = _rec["degree"]
+        _mr = marker_radius if 2 <= _deg <= 12 else max(4, marker_radius // 2)
+        _mt = marker_thickness if 2 <= _deg <= 12 else max(1, marker_thickness // 2)
+        draw_marker(output_img, _rec["x"], _rec["y"], _mr,
+                    shape_colors.get(_rec["shape"], (0, 0, 0)), _mt,
+                    _rec["marker"] == "square")
+
+    if shape_colors:
+        _fs = max(0.42, img_diag / 2700.0)
+        _lh = int(38 * _fs) + 6
+        _sw = int(20 * _fs)
+        _x0, _y0 = 8, 8
+        _font = cv2.FONT_HERSHEY_SIMPLEX
+        for _i, (_sh, _cnt) in enumerate(
+                sorted(shape_counts.items(), key=lambda kv: (-kv[1], kv[0]))):
+            _yy = _y0 + _i * _lh
+            _col = shape_colors[_sh]
+            _sq = any(r["shape"] == _sh and r["marker"] == "square"
+                      for r in node_records)
+            if _sq:
+                cv2.rectangle(output_img, (_x0, _yy), (_x0 + _sw, _yy + _sw),
+                              _col, max(2, int(_fs * 3)))
+            else:
+                cv2.circle(output_img, (_x0 + _sw // 2, _yy + _sw // 2),
+                           _sw // 2, _col, max(2, int(_fs * 3)))
+            cv2.putText(output_img, "%s : %d" % (_sh, _cnt),
+                        (_x0 + _sw + 8, _yy + _sw - 2), _font, _fs,
+                        (0, 0, 0), max(1, int(_fs * 2)), cv2.LINE_AA)
+
     return {
         "output_img": output_img,
         "shape_type": shape_type,
@@ -2304,6 +2164,7 @@ def detect_grid_patterns_robust(img, prune_length=4):
         "nodes": node_records,
         "circle_count": total_circles_found,
         "shape_counts": shape_counts,
+        "shape_colors": shape_colors,
     }
 
 
