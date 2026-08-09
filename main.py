@@ -5,6 +5,8 @@ from skimage.morphology import skeletonize
 import math
 import hashlib
 import re
+import energy as _energy
+import geometry as _geometry
 
 def assign_shape_colors(names):
     """Give every distinct shape name its own DISTINCT colour by spreading hues
@@ -189,24 +191,36 @@ def consolidate_shape_angles(shape_counts, node_records, tol=5.0):
 
     remap = {}
     for _tmpl, _items in groups.items():
-        _items.sort(key=lambda e: e[0])
-        clusters = []
-        for _entry in _items:
-            _nums = _entry[0]
-            # Same-template shapes merge only if their FIRST number (the panel /
-            # element COUNT, e.g. the 4 in '4-panel') is IDENTICAL -- otherwise
-            # different element types (2-panel vs 4-panel) would wrongly merge.
-            # Remaining numbers (the measured angles) may differ within `tol`.
-            if clusters:
-                _prev = clusters[-1][-1][0]
-                if (_prev[0] == _nums[0] and
-                        all(abs(a - b) <= tol
-                            for a, b in zip(_prev[1:], _nums[1:]))):
-                    clusters[-1].append(_entry)   # chain to the nearest neighbour
-                    continue
-            clusters.append([_entry])
+        # Single-linkage clustering (union-find over ALL pairs, not just
+        # neighbours in a sort): two labels are the same element when their FIRST
+        # number (the panel / element COUNT, e.g. the 4 in '4-panel') is IDENTICAL
+        # -- so a 2-panel never merges with a 4-panel -- and every other number
+        # (the measured angles) is within `tol`. Comparing all pairs means labels
+        # that differ in more than one number still merge, e.g. asymY-59-120 and
+        # asymY-60-120 (alpha 59 vs 60, same omega).
+        _n = len(_items)
+        _parent = list(range(_n))
 
-        for _cl in clusters:
+        def _find(_a):
+            while _parent[_a] != _a:
+                _parent[_a] = _parent[_parent[_a]]
+                _a = _parent[_a]
+            return _a
+
+        for _i in range(_n):
+            for _j in range(_i + 1, _n):
+                _ni, _nj = _items[_i][0], _items[_j][0]
+                if (_ni[0] == _nj[0] and
+                        all(abs(a - b) <= tol for a, b in zip(_ni[1:], _nj[1:]))):
+                    _ra, _rb = _find(_i), _find(_j)
+                    if _ra != _rb:
+                        _parent[_rb] = _ra
+
+        _clusters = {}
+        for _i in range(_n):
+            _clusters.setdefault(_find(_i), []).append(_items[_i])
+
+        for _cl in _clusters.values():
             if len(_cl) < 2:
                 continue
             _tot = sum(c for _, c, _ in _cl)
@@ -1414,13 +1428,13 @@ def classify_node_shape(dirs, straight, degree=None, on_circle=False, wedge_angs
                 return "3-panel-claw-%s" % _afmt(round(min_gap))
             # The arc is the ~180 panel; the spoke splits the remaining ~180.
             # Equal halves (90/90) = spoke perpendicular to the arc -> 3e-arc;
-            # unequal halves (e.g. 120/60) = spoke slanted -> 3f-arc, whose angle
-            # (the smaller spoke-side panel, phi_4) is carried in the name so the
-            # asymmetric-Y energy formula can be evaluated per instance.
+            # unequal halves (e.g. 120/60) = spoke slanted -> 3-panel-asymY-arc,
+            # whose angle (the smaller spoke-side panel) is carried in the name so
+            # the asymmetric-Y energy formula can be evaluated per instance.
             _rest = sorted(gaps)[:2]        # the two spoke-side panels
             if len(_rest) == 2 and abs(_rest[0] - _rest[1]) < 20.0:
-                return "3e-arc"
-            return "3f-arc-%s" % _afmt(round(min(_rest)))
+                return "3-panel-claw-arc-90(3e-arc)"
+            return "3-panel-asymY-arc-%s" % _afmt(round(min(_rest)))
         if degree == 5:
             # 5-crc-panel = a 3T element + a 2-panel corner. The label carries the
             # corner opening.
@@ -1480,11 +1494,67 @@ def classify_node_shape(dirs, straight, degree=None, on_circle=False, wedge_angs
         if curved:
             if max_gap >= 200.0:          # bunched curved arms = claw
                 return "3-panel-claw-%s" % _afmt(round(min_gap))
-            return "3e-arc"               # balanced curved 3-node
+            return "3-panel-claw-arc-90(3e-arc)"   # balanced curved 3-node
         # claw = arms bunched, NO straight line through (widest panel > ~200)
         if max_gap >= 200.0:
             return "3-panel-claw-%s" % _afmt(round(min_gap))
-        # straight line + slanted branch, or symmetric spread = Y
+        # A straight line passing through the node (a ~180 panel, drawn with a
+        # SQUARE marker) plus a slanted branch is an ASYMMETRIC Y, a different
+        # element from the symmetric three-pronged Y. Two angles are carried in
+        # the name: alpha (the smallest panel) and omega (the tilt of the
+        # straight through-line, "line x", from the horizontal image axis).
+        # A node with no straight line (symmetric, e.g. 120/120/120) stays a Y.
+        if max_gap >= 150.0:
+            # Find the collinear through-pair (line x) and the branch. The BETA
+            # arm is the through-arm that makes the LARGER gap (beta = 180 - alpha)
+            # with the branch; the other through-arm is the ALPHA arm.
+            _pair = None
+            for _i in range(len(dirs)):
+                for _j in range(_i + 1, len(dirs)):
+                    if (dirs[_i][0] * dirs[_j][0]
+                            + dirs[_i][1] * dirs[_j][1]) < -0.9:
+                        _pair = (_i, _j)
+                        break
+                if _pair is not None:
+                    break
+            _betaarm = dirs[0]
+            _alphaarm = dirs[0]
+            _bd = dirs[0]
+            if _pair is not None:
+                _brs = [dirs[_k] for _k in range(len(dirs)) if _k not in _pair]
+                if _brs:
+                    _bd = _brs[0]
+
+                    def _gap(_d1, _d2):
+                        _dt = max(-1.0, min(1.0, _d1[0] * _d2[0] + _d1[1] * _d2[1]))
+                        return math.degrees(math.acos(_dt))
+                    _a1, _a2 = dirs[_pair[0]], dirs[_pair[1]]
+                    if _gap(_bd, _a1) > _gap(_bd, _a2):
+                        _betaarm, _alphaarm = _a1, _a2
+                    else:
+                        _betaarm, _alphaarm = _a2, _a1
+            # omega is measured INSIDE the straight-line panel (the side without the
+            # branch, so it never overlaps alpha or beta): from the horizontal ray
+            # that lies in that panel to the beta arm. Depending on the node's
+            # orientation this gives omega ~ 45 or ~ 135, i.e. two groups.
+            _ba = math.degrees(math.atan2(_betaarm[1], _betaarm[0])) % 360.0
+            _aa = math.degrees(math.atan2(_alphaarm[1], _alphaarm[0])) % 360.0
+            _brA = math.degrees(math.atan2(_bd[1], _bd[0])) % 360.0
+
+            def _ins(_t, _lo, _hi):
+                return ((_t - _lo) % 360.0) <= ((_hi - _lo) % 360.0)
+            if _ins(_brA, _ba, _aa):        # branch inside ba->aa: panel is aa->ba
+                _lo, _hi = _aa, _ba
+            else:
+                _lo, _hi = _ba, _aa
+            _hin = 0.0 if _ins(0.0, _lo, _hi) else 180.0
+            _omega = abs(((_ba - _hin + 180.0) % 360.0) - 180.0)
+            # a line orientation is only defined mod 180: omega = 180 (through-line
+            # horizontal but beta-arm points the opposite way) is the SAME line as
+            # omega = 0, so fold it back. This merges mirror-image horizontal nodes.
+            _omega = round(_omega) % 180
+            return "3-panel-asymY-%s-%s" % (_afmt(round(min_gap)),
+                                            _afmt(round(_omega)))
         return "3-panel-Y-%s" % _afmt(round(min_gap))
 
     if n == 4:
@@ -1508,7 +1578,8 @@ def classify_node_shape(dirs, straight, degree=None, on_circle=False, wedge_angs
                 _mi = gaps.index(max(gaps))
                 _ng = len(gaps)
                 _sidek = max(gaps[(_mi + 1) % _ng], gaps[(_mi - 1) % _ng])
-                return "4-cir-k-%s" % _afmt(round(_sidek))
+                # arc (not a straight line) passes through -> curved-k family
+                return "4-panel-K-arc-%s" % _afmt(round(_sidek))
             if max_gap > 184.0:
                 # widest gap is not a straight line -> 3-claw + 1 separate arm
                 # The claw angle comes from the two internal claw gaps. If they
@@ -2353,13 +2424,13 @@ def detect_grid_patterns_robust(img, prune_length=4):
             # straight line makes a '+' -> 4-panel-90 (wedges already rebuilt).
             shape = "4-panel-90"
         elif node_type == 'ring3':
-            shape = "3e-arc"
+            shape = "3-panel-claw-arc-90(3e-arc)"
         elif is_lens:
             if _lens_cross:
                 shape = "4-panel-X-%s" % _afmt(
                     max(1, round(_lens_ang)) if _lens_ang is not None else 90)
             else:
-                shape = "4-cir-k-%s" % _afmt(max(1, round(_lens_ang)) if _lens_ang is not None else 45)
+                shape = "4-panel-K-arc-%s" % _afmt(max(1, round(_lens_ang)) if _lens_ang is not None else 45)
         else:
             _adirs = [a[0] for a in arms]
             _astr = [arm_is_straight(a[1], scy, scx) for a in arms]
@@ -2389,6 +2460,15 @@ def detect_grid_patterns_robust(img, prune_length=4):
     # e.g. 4-cir-k-31 and 4-cir-k-32 -> one category.
     shape_counts = consolidate_shape_angles(shape_counts, node_records)
 
+    # ---- crashworthiness numbers (RT membrane energy, RG complexity, Omega) ----
+    _skel_len_px = analytical_skeleton_length_px(skeleton, detected_circles)
+    _outer_area_px = enclosed_area_px(skeleton, float(cv2.contourArea(main_contour)))
+    _en = _energy.compute_energy(shape_counts, total_circles_found)
+    _RT = _en["RT"]
+    _geo = _geometry.compute_geometry(shape_type, _skel_len_px, _outer_area_px, _RT)
+    _RG = _geo["RG"]
+    _OMEGA = _geo["omega"]
+
     # ---- colour every marker by its SHAPE type + draw a legend ----
     shape_colors = assign_shape_colors(shape_counts.keys())
     for _rec in node_records:
@@ -2398,6 +2478,32 @@ def detect_grid_patterns_robust(img, prune_length=4):
         draw_marker(output_img, _rec["x"], _rec["y"], _mr,
                     shape_colors.get(_rec["shape"], (0, 0, 0)), _mt,
                     _rec["marker"] == "square")
+
+    # ---- RT / RG / Omega panel in the TOP-RIGHT corner of the figure ----
+    def _fmt(_v):
+        return "--" if _v is None else ("%.2f" % _v)
+    _pf = max(0.5, img_diag / 2300.0)
+    _pth = max(1, int(_pf * 2))
+    _pfont = cv2.FONT_HERSHEY_SIMPLEX
+    _lines = ["RT = %s" % _fmt(_RT),
+              "RG = %s" % _fmt(_RG),
+              "Omega = %s" % _fmt(_OMEGA)]
+    _tsz = [cv2.getTextSize(_l, _pfont, _pf, _pth)[0] for _l in _lines]
+    _tw = max(_w for _w, _h in _tsz)
+    _th0 = max(_h for _w, _h in _tsz)
+    _plh = int(_th0 * 1.9)
+    _pad = int(10 * _pf)
+    _Wimg = output_img.shape[1]
+    _bx1 = _Wimg - _pad
+    _bx0 = _bx1 - _tw - 2 * _pad
+    _by0 = _pad
+    _by1 = _by0 + len(_lines) * _plh + _pad
+    cv2.rectangle(output_img, (_bx0, _by0), (_bx1, _by1), (255, 255, 255), -1)
+    cv2.rectangle(output_img, (_bx0, _by0), (_bx1, _by1), (60, 60, 60), _pth)
+    for _i, _l in enumerate(_lines):
+        _ty = _by0 + _pad + int(_th0) + _i * _plh
+        cv2.putText(output_img, _l, (_bx0 + _pad, _ty), _pfont, _pf,
+                    (0, 0, 0), _pth, cv2.LINE_AA)
 
     if shape_colors or total_circles_found:
         _fs = max(0.42, img_diag / 2700.0)
@@ -2441,9 +2547,11 @@ def detect_grid_patterns_robust(img, prune_length=4):
         "circle_count": total_circles_found,
         "shape_counts": shape_counts,
         "shape_colors": shape_colors,
-        "skel_len_px": analytical_skeleton_length_px(skeleton, detected_circles),
-        "outer_area_px": enclosed_area_px(
-            skeleton, float(cv2.contourArea(main_contour))),
+        "skel_len_px": _skel_len_px,
+        "outer_area_px": _outer_area_px,
+        "RT": _RT,
+        "RG": _RG,
+        "omega": _OMEGA,
     }
 
 
