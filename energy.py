@@ -74,29 +74,28 @@ def e_X(a):
 
 
 def e_asymY(a):
-    """Arc asymmetric-Y (the old 3f element):  4 * [ tan(a/2) + 2 sin(a) ]."""
+    """3-panel-asymY (STRAIGHT-LINE version): from the general two-angle
+    expression
+        8 tan(a/4 + w/2) + 8 tan|a/4 - w/2|
+        + 4 sin(a/2 + w) + 4 sin|a/2 - w| + 12 sin(a)
+    with a = alpha = X = the smallest (acute) angle. The two angles are tied by
+    the fixed relation w = a/2, which zeroes the two absolute-value terms and
+    reduces the formula to
+
+        8 tan(a/2) + 16 sin(a).
+    """
+    return 8.0 * _t(a / 2.0) + 16.0 * _s(a)
+
+
+def e_asymY_arc(a):
+    """3-panel-asymY-ARC version: the ORIGINAL single-angle asymmetric-shape
+    formula (the old 3f-arc element)
+
+        4 [ tan(a/2) + 2 sin(a) ].
+
+    This is DIFFERENT from the straight-line e_asymY above: the arc element keeps
+    this original formula, the straight-line one uses 8 tan(a/2) + 16 sin(a)."""
     return 4.0 * (_t(a / 2.0) + 2.0 * _s(a))
-
-
-def e_asymY2(alpha, omega):
-    """3-panel-asymY (straight line through + slanted branch), the two-angle
-    formula from the Word document:
-        8 tan(a/4 + w/2) + 8 tan(|a/4 - w/2|)
-        + 4 sin(a/2 + w) + 4 sin(|a/2 - w|) + 12 sin(a)
-    with a = alpha and w = omega.
-
-    NOTE: the alpha / omega convention still needs confirmation from the
-    supervisor. Here alpha is the smallest panel of the node, and because a
-    straight-through degree-3 Y has only one free angle, omega is derived from it
-    as omega = 180 - alpha (i.e. beta). If the supervisor defines omega
-    differently, change the single line that sets `_w` in element_energy."""
-    a = alpha
-    w = omega
-    return (8.0 * _t(a / 4.0 + w / 2.0)
-            + 8.0 * _t(abs(a / 4.0 - w / 2.0))
-            + 4.0 * _s(a / 2.0 + w)
-            + 4.0 * _s(abs(a / 2.0 - w))
-            + 12.0 * _s(a))
 
 
 # fixed-value elements (angle is implied by the name)
@@ -150,24 +149,18 @@ def element_energy(name):
         return E_3T
     if s.startswith("3-panel-claw-arc") or s == "3e-arc":
         return E_3E_ARC
+    # NOTE: the ARC variant must be tested BEFORE the straight-line one, because
+    # its name "3-panel-asymY-arc" also starts with "3-panel-asymY".
     if s.startswith("3-panel-asymY-arc") or s.startswith("3f-arc"):
-        # arc asymmetric-Y (the renamed 3f element): one-angle formula.
+        # ARC asymmetric-Y: the ORIGINAL formula 4[tan(X/2) + 2 sin(X)].
         _a = _nums(s)
-        return e_asymY(_a[-1]) if _a else None
+        _tail = _a[1:] if len(_a) >= 2 else _a
+        return e_asymY_arc(min(_tail)) if _tail else None
     if s.startswith("3-panel-asymY"):
-        # straight-line asymmetric-Y: two-angle formula. The name carries both
-        # angles as "3-panel-asymY-<alpha>-<omega>": alpha is the smallest panel,
-        # omega is the tilt of the straight through-line from the horizontal.
-        # (The horizontal reference / omega convention is pending supervisor
-        # confirmation; if it changes, only the classifier's omega needs editing.)
+        # STRAIGHT-LINE asymmetric-Y: 8 tan(X/2) + 16 sin(X). X = smallest angle.
         _a = _nums(s)
-        if len(_a) >= 3:
-            _alpha, _w = _a[-2], _a[-1]
-        elif _a:
-            _alpha = _w = _a[-1]
-        else:
-            return None
-        return e_asymY2(_alpha, _w)
+        _tail = _a[1:] if len(_a) >= 2 else _a
+        return e_asymY(min(_tail)) if _tail else None
     if s.startswith("4-panel-90"):
         return E_4PANEL_90
     if s.startswith("6-panel-60"):

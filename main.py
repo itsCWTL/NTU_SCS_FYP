@@ -47,98 +47,6 @@ def skeleton_length_px(skel):
     return Lo + Ld * math.sqrt(2.0)
 
 
-def analytical_skeleton_length_px(skel, circles=None, dp_eps=2.0):
-    """Total drawn length measured the ANALYTICAL / "formula" way: break the
-    skeleton into its actual segments and measure each by geometry rather than by
-    counting pixels.
-
-      * straight segment -> endpoint-to-endpoint distance (exact at ANY angle, so
-        a 45 deg diagonal gives side*sqrt2, a 60 deg hexagon edge its true length);
-      * arc lying on a detected circle -> r * (subtended angle).
-
-    The skeleton is split at junctions/endpoints (pixels whose neighbour count !=
-    2); straight runs between them are simplified with Douglas-Peucker and summed,
-    closed loops (plain outlines with no junction) are simplified as closed
-    polygons. Reproduces S2 = 450, S4 = 512, hexagon/circle to <1%."""
-    ys, xs = np.where(skel)
-    S = set(zip(ys.tolist(), xs.tolist()))
-    if not S:
-        return 0.0
-    circles = circles or []
-
-    def nbrs(p):
-        r, c = p
-        out = []
-        for dr in (-1, 0, 1):
-            for dc in (-1, 0, 1):
-                if (dr or dc) and (r + dr, c + dc) in S:
-                    out.append((r + dr, c + dc))
-        return out
-
-    deg = {p: len(nbrs(p)) for p in S}
-    nodes = set(p for p in S if deg[p] != 2)
-
-    def seg_len(path, closed):
-        if len(path) < 2:
-            return 0.0
-        for (cx, cy, rr) in circles:            # arc on a detected circle?
-            on = sum(1 for (r, c) in path
-                     if abs(math.hypot(c - cx, r - cy) - rr) < max(4.0, 0.06 * rr))
-            if len(path) > 10 and on >= 0.8 * len(path):
-                ang = 0.0
-                for i in range(1, len(path)):
-                    b0 = math.atan2(path[i - 1][0] - cy, path[i - 1][1] - cx)
-                    b1 = math.atan2(path[i][0] - cy, path[i][1] - cx)
-                    ang += (b1 - b0 + math.pi) % (2 * math.pi) - math.pi
-                return abs(ang) * rr
-        pts = np.array([[c, r] for r, c in path], dtype=np.int32).reshape(-1, 1, 2)
-        ap = [tuple(x[0]) for x in cv2.approxPolyDP(pts, dp_eps, closed)]
-        rng = range(len(ap)) if closed else range(1, len(ap))
-        return sum(math.hypot(ap[i][0] - ap[i - 1][0], ap[i][1] - ap[i - 1][1])
-                   for i in rng)
-
-    total = 0.0
-    visited = set()
-    edge_used = set()
-    for n in nodes:                              # node-to-node edges
-        for m in nbrs(n):
-            if frozenset((n, m)) in edge_used:
-                continue
-            path = [n]
-            prev, cur = n, m
-            while True:
-                path.append(cur)
-                if cur in nodes:
-                    break
-                nxt = [q for q in nbrs(cur) if q != prev]
-                if not nxt:
-                    break
-                prev, cur = cur, nxt[0]
-            edge_used.add(frozenset((n, m)))
-            edge_used.add(frozenset((path[-1], path[-2])))
-            for q in path:
-                visited.add(q)
-            total += seg_len(path, False)
-    for p in S:                                  # closed loops (no junction)
-        if p in visited:
-            continue
-        path = [p]
-        visited.add(p)
-        nb = nbrs(p)
-        if not nb:
-            continue
-        prev, cur = p, nb[0]
-        while cur not in visited:
-            path.append(cur)
-            visited.add(cur)
-            nxt = [q for q in nbrs(cur) if q != prev]
-            if not nxt:
-                break
-            prev, cur = cur, nxt[0]
-        total += seg_len(path, True)
-    return total
-
-
 def enclosed_area_px(skel, fallback_area=0.0):
     """Area (px^2) enclosed by the OUTER skeleton loop -- i.e. bounded by the wall
     CENTRE-LINES, the same place the length is measured. Flood-fills the exterior
@@ -154,6 +62,308 @@ def enclosed_area_px(skel, fallback_area=0.0):
     if fallback_area > 0 and enclosed < 0.5 * fallback_area:
         return float(fallback_area)
     return float(enclosed)
+
+
+def analytic_polygon_len_px(skel, dp_eps=2.0):
+    """Total length of a straight-walled (polygon) section measured the ANALYTIC
+    way: split the skeleton into node-to-node segments and closed loops, and
+    measure each by endpoint / Douglas-Peucker distance rather than by pixel
+    steps. On a slanted wall (e.g. the 60-degree edges of a hexagon) the pixel
+    step count follows a staircase that is slightly longer than the real edge, so
+    it OVER-measures; endpoint distance gives the true straight length at any
+    angle. Intended for square / hexagon sections that have no circles."""
+    ys, xs = np.where(skel > 0)
+    S = set(zip(ys.tolist(), xs.tolist()))
+    if not S:
+        return 0.0
+
+    def _nbrs(p):
+        r, c = p
+        out = []
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if (dr or dc) and (r + dr, c + dc) in S:
+                    out.append((r + dr, c + dc))
+        return out
+
+    _deg = {p: len(_nbrs(p)) for p in S}
+    _nodes = set(p for p in S if _deg[p] != 2)
+
+    def _straight(path, closed):
+        if len(path) < 2:
+            return 0.0
+        pts = np.array([[c, r] for r, c in path], dtype=np.int32).reshape(-1, 1, 2)
+        ap = [tuple(x[0]) for x in cv2.approxPolyDP(pts, dp_eps, closed)]
+        rng = range(len(ap)) if closed else range(1, len(ap))
+        return sum(math.hypot(ap[i][0] - ap[i - 1][0], ap[i][1] - ap[i - 1][1])
+                   for i in rng)
+
+    total = 0.0
+    visited = set()
+    edge_used = set()
+    for n in _nodes:
+        for m in _nbrs(n):
+            if frozenset((n, m)) in edge_used:
+                continue
+            path = [n]
+            prev, cur = n, m
+            while True:
+                path.append(cur)
+                if cur in _nodes:
+                    break
+                nxt = [q for q in _nbrs(cur) if q != prev]
+                if not nxt:
+                    break
+                prev, cur = cur, nxt[0]
+            edge_used.add(frozenset((n, m)))
+            edge_used.add(frozenset((path[-1], path[-2])))
+            for q in path:
+                visited.add(q)
+            total += _straight(path, False)
+    for p in S:
+        if p in visited:
+            continue
+        path = [p]
+        visited.add(p)
+        nb = _nbrs(p)
+        if not nb:
+            continue
+        prev, cur = p, nb[0]
+        while cur not in visited:
+            path.append(cur)
+            visited.add(cur)
+            nxt = [q for q in _nbrs(cur) if q != prev]
+            if not nxt:
+                break
+            prev, cur = cur, nxt[0]
+        total += _straight(path, True)
+    return total
+
+
+def composite_reconstruct_len_px(skel, circles, shape_type):
+    """Length correction for the 'circle inscribed in a polygon' composite
+    (e.g. octagon O2, square S15): a full circle sits inside a polygon and is
+    TANGENT to every polygon edge at its mid-point. At each tangent point the
+    circle and the straight edge come closer than the wall thickness, so the
+    skeleton merges them into a single centre-line and the total length is
+    under-measured (O2 by ~7%).
+
+    Where this exact geometry is detected, the outer walls are rebuilt from the
+    clean detected primitives instead of the tangled skeleton:
+
+        length = 2*pi*r  +  polygon perimeter  +  N spokes (centre -> vertex)
+
+    Returns the reconstructed length in pixels, or None when the section is NOT
+    this composite (so the normal pixel-count length is kept unchanged). The
+    trigger is deliberately strict -- a detected circle whose radius equals the
+    polygon's in-radius (tangent to the edges), vertices that poke out past the
+    circle, and N verified radial spokes -- so it fires only on this family and
+    leaves every other section untouched."""
+    if not circles or shape_type not in ("Quadrilateral", "Hexagon", "Octagon"):
+        return None
+    N = EXPECTED_SIDES.get(shape_type, -1)
+    cont, _ = cv2.findContours((skel > 0).astype(np.uint8) * 255,
+                               cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
+    if not cont:
+        return None
+    c = max(cont, key=cv2.contourArea)
+    ap = cv2.approxPolyDP(c, 0.02 * cv2.arcLength(c, True), True).reshape(-1, 2)
+    if len(ap) != N:
+        return None
+    cx, cy, r = max(circles, key=lambda z: z[2])
+    if r <= 0:
+        return None
+    Rc = float(np.mean([math.hypot(v[0] - cx, v[1] - cy) for v in ap]))   # circumradius
+    inr = float(np.mean([math.hypot((ap[i][0] + ap[(i + 1) % N][0]) / 2.0 - cx,
+                                     (ap[i][1] + ap[(i + 1) % N][1]) / 2.0 - cy)
+                         for i in range(N)]))                              # in-radius
+    if not (abs(r - inr) / r < 0.06 and Rc > r * 1.03):
+        return None
+    # verify N radial spokes are present inside the circle (guards against a
+    # polygon+circle that is not this spoked composite)
+    ys, xs = np.where(skel > 0)
+    d = np.hypot(xs - cx, ys - cy)
+    inner = np.zeros_like(skel)
+    m = d < 0.9 * r
+    inner[ys[m], xs[m]] = 1
+    Lin = skeleton_length_px(inner)
+    if N * 0.9 * r <= 0 or abs(Lin - N * 0.9 * r) / (N * 0.9 * r) >= 0.20:
+        return None
+    Poly = sum(math.hypot(ap[i][0] - ap[(i + 1) % N][0],
+                          ap[i][1] - ap[(i + 1) % N][1]) for i in range(N))
+    return 2.0 * math.pi * r + Poly + N * Rc
+
+
+def circle_packing_len_px(skel, circles):
+    """Length correction for a section whose walls are (almost) all circles --
+    e.g. the plain circular tube C1 or a tangent circle-packing like C14. The
+    8-connected pixel count OVER-measures a smooth circle by ~5% (the staircase
+    of the digitised curve is longer than the true arc), while tangent contacts
+    between packed circles LOSE a little length where the skeleton merges them.
+    Both errors are removed by measuring each circle from a least-squares fit to
+    its own skeleton pixels and using its exact circumference 2*pi*r.
+
+    Applied ONLY when at least 92% of the skeleton lies on detected circles (a
+    near-pure circle packing); a mixed circle+straight section keeps the ordinary
+    pixel-count length, because separating the straight walls from the circles is
+    not clean enough there. Returns the reconstructed length in px, or None."""
+    if not circles:
+        return None
+    ys, xs = np.where(skel > 0)
+    if len(ys) < 20:
+        return None
+    fx = xs.astype(np.float64)
+    fy = ys.astype(np.float64)
+    on_circle = np.zeros(len(ys), dtype=bool)
+    csum = 0.0
+    for (cx, cy, r) in circles:
+        sel = np.abs(np.hypot(fx - cx, fy - cy) - r) < max(4.0, 0.06 * r)
+        on_circle |= sel
+        if int(sel.sum()) >= 20:                       # least-squares refit
+            px, py = fx[sel], fy[sel]
+            A = np.c_[2 * px, 2 * py, np.ones(len(px))]
+            b = px * px + py * py
+            sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+            rr = math.sqrt(max(0.0, sol[2] + sol[0] ** 2 + sol[1] ** 2))
+            csum += 2.0 * math.pi * rr
+        else:
+            csum += 2.0 * math.pi * r
+    total = skeleton_length_px(skel)
+    non = np.zeros_like(skel)
+    non[ys[~on_circle], xs[~on_circle]] = 1
+    non_circle_len = skeleton_length_px(non)
+    if total <= 0 or (total - non_circle_len) / total < 0.92:
+        return None
+    return csum + non_circle_len
+
+
+def isolated_circle_len_px(skel, circles, dp_eps=2.0):
+    """Length for a section whose walls are STRAIGHT lines plus one or more
+    circles that do NOT touch each other (e.g. C3: a circle with an internal
+    cross; C4 / C10 / C16: a circle with an internal star). Plain step-counting
+    over-measures the circle by ~5% (its staircase is longer than the true arc),
+    and the pure-circle refit (circle_packing) does not apply because straight
+    walls are present. Here each full circle is measured by its exact 2*pi*r
+    (least-squares refit) and the straight walls are measured segment-by-segment
+    by endpoint distance (exact at any angle); segments that lie on a circle are
+    skipped so the circle is counted once.
+
+    Returns the length in px, or None when the section is NOT this case: no
+    circles; any two circles tangent to one another (a packing, where the merged
+    skeleton would double-count -- handled by step-count / circle_packing); or an
+    almost-pure circle section (<=8% straight, left to circle_packing)."""
+    if not circles:
+        return None
+    # reject if any two circles touch (external or internal tangency -> packing)
+    for _i in range(len(circles)):
+        for _j in range(_i + 1, len(circles)):
+            _c1, _c2 = circles[_i], circles[_j]
+            _d = math.hypot(_c1[0] - _c2[0], _c1[1] - _c2[1])
+            _tol = 0.08 * max(_c1[2], _c2[2])
+            if (abs(_d - (_c1[2] + _c2[2])) < _tol
+                    or abs(_d - abs(_c1[2] - _c2[2])) < _tol):
+                return None
+    ys, xs = np.where(skel > 0)
+    if len(ys) < 20:
+        return None
+    fx = xs.astype(np.float64)
+    fy = ys.astype(np.float64)
+    ref = []
+    csum = 0.0
+    on_any = np.zeros(len(ys), dtype=bool)
+    for (cx, cy, r) in circles:
+        sel = np.abs(np.hypot(fx - cx, fy - cy) - r) < max(4.0, 0.06 * r)
+        on_any |= sel
+        if int(sel.sum()) >= 20:
+            px, py = fx[sel], fy[sel]
+            A = np.c_[2 * px, 2 * py, np.ones(len(px))]
+            b = px * px + py * py
+            sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+            rr = math.sqrt(max(0.0, sol[2] + sol[0] ** 2 + sol[1] ** 2))
+            if abs(rr - r) > 0.25 * r:
+                rr = r
+        else:
+            rr = r
+        ref.append((cx, cy, rr))
+        csum += 2.0 * math.pi * rr
+    total_px = skeleton_length_px(skel)
+    non = np.zeros_like(skel)
+    non[ys[~on_any], xs[~on_any]] = 1
+    if total_px <= 0 or skeleton_length_px(non) / total_px <= 0.08:
+        return None                     # near-pure circle -> circle_packing
+    S = set(zip(ys.tolist(), xs.tolist()))
+
+    def _nbrs(p):
+        r, c = p
+        out = []
+        for dr in (-1, 0, 1):
+            for dc in (-1, 0, 1):
+                if (dr or dc) and (r + dr, c + dc) in S:
+                    out.append((r + dr, c + dc))
+        return out
+
+    _deg = {p: len(_nbrs(p)) for p in S}
+    _nodes = set(p for p in S if _deg[p] != 2)
+
+    def _is_arc(path):
+        if len(path) <= 10:
+            return False
+        for (cx, cy, r) in ref:
+            on = sum(1 for (rr, cc) in path
+                     if abs(math.hypot(cc - cx, rr - cy) - r) < max(4.0, 0.06 * r))
+            if on >= 0.8 * len(path):
+                return True
+        return False
+
+    def _straight(path, closed):
+        pts = np.array([[c, r] for r, c in path], dtype=np.int32).reshape(-1, 1, 2)
+        ap = [tuple(x[0]) for x in cv2.approxPolyDP(pts, dp_eps, closed)]
+        rng = range(len(ap)) if closed else range(1, len(ap))
+        return sum(math.hypot(ap[i][0] - ap[i - 1][0], ap[i][1] - ap[i - 1][1])
+                   for i in rng)
+
+    total = csum
+    visited = set()
+    edge_used = set()
+    for n in _nodes:
+        for m in _nbrs(n):
+            if frozenset((n, m)) in edge_used:
+                continue
+            path = [n]
+            prev, cur = n, m
+            while True:
+                path.append(cur)
+                if cur in _nodes:
+                    break
+                nxt = [q for q in _nbrs(cur) if q != prev]
+                if not nxt:
+                    break
+                prev, cur = cur, nxt[0]
+            edge_used.add(frozenset((n, m)))
+            edge_used.add(frozenset((path[-1], path[-2])))
+            for q in path:
+                visited.add(q)
+            if not _is_arc(path):
+                total += _straight(path, False)
+    for p in S:
+        if p in visited:
+            continue
+        path = [p]
+        visited.add(p)
+        nb = _nbrs(p)
+        if not nb:
+            continue
+        prev, cur = p, nb[0]
+        while cur not in visited:
+            path.append(cur)
+            visited.add(cur)
+            nxt = [q for q in _nbrs(cur) if q != prev]
+            if not nxt:
+                break
+            prev, cur = cur, nxt[0]
+        if not _is_arc(path):
+            total += _straight(path, True)
+    return total
 
 
 _NUM_RE = re.compile(r"\d+(?:\.\d+)?")
@@ -1500,61 +1710,13 @@ def classify_node_shape(dirs, straight, degree=None, on_circle=False, wedge_angs
             return "3-panel-claw-%s" % _afmt(round(min_gap))
         # A straight line passing through the node (a ~180 panel, drawn with a
         # SQUARE marker) plus a slanted branch is an ASYMMETRIC Y, a different
-        # element from the symmetric three-pronged Y. Two angles are carried in
-        # the name: alpha (the smallest panel) and omega (the tilt of the
-        # straight through-line, "line x", from the horizontal image axis).
+        # element from the symmetric three-pronged Y. It is named by X = the
+        # SMALLEST angle of the junction (the acute branch panel). Its membrane
+        # energy uses the fixed relation omega = alpha/2 (see energy.e_asymY), so
+        # no separate orientation angle is measured or stored.
         # A node with no straight line (symmetric, e.g. 120/120/120) stays a Y.
         if max_gap >= 150.0:
-            # Find the collinear through-pair (line x) and the branch. The BETA
-            # arm is the through-arm that makes the LARGER gap (beta = 180 - alpha)
-            # with the branch; the other through-arm is the ALPHA arm.
-            _pair = None
-            for _i in range(len(dirs)):
-                for _j in range(_i + 1, len(dirs)):
-                    if (dirs[_i][0] * dirs[_j][0]
-                            + dirs[_i][1] * dirs[_j][1]) < -0.9:
-                        _pair = (_i, _j)
-                        break
-                if _pair is not None:
-                    break
-            _betaarm = dirs[0]
-            _alphaarm = dirs[0]
-            _bd = dirs[0]
-            if _pair is not None:
-                _brs = [dirs[_k] for _k in range(len(dirs)) if _k not in _pair]
-                if _brs:
-                    _bd = _brs[0]
-
-                    def _gap(_d1, _d2):
-                        _dt = max(-1.0, min(1.0, _d1[0] * _d2[0] + _d1[1] * _d2[1]))
-                        return math.degrees(math.acos(_dt))
-                    _a1, _a2 = dirs[_pair[0]], dirs[_pair[1]]
-                    if _gap(_bd, _a1) > _gap(_bd, _a2):
-                        _betaarm, _alphaarm = _a1, _a2
-                    else:
-                        _betaarm, _alphaarm = _a2, _a1
-            # omega is measured INSIDE the straight-line panel (the side without the
-            # branch, so it never overlaps alpha or beta): from the horizontal ray
-            # that lies in that panel to the beta arm. Depending on the node's
-            # orientation this gives omega ~ 45 or ~ 135, i.e. two groups.
-            _ba = math.degrees(math.atan2(_betaarm[1], _betaarm[0])) % 360.0
-            _aa = math.degrees(math.atan2(_alphaarm[1], _alphaarm[0])) % 360.0
-            _brA = math.degrees(math.atan2(_bd[1], _bd[0])) % 360.0
-
-            def _ins(_t, _lo, _hi):
-                return ((_t - _lo) % 360.0) <= ((_hi - _lo) % 360.0)
-            if _ins(_brA, _ba, _aa):        # branch inside ba->aa: panel is aa->ba
-                _lo, _hi = _aa, _ba
-            else:
-                _lo, _hi = _ba, _aa
-            _hin = 0.0 if _ins(0.0, _lo, _hi) else 180.0
-            _omega = abs(((_ba - _hin + 180.0) % 360.0) - 180.0)
-            # a line orientation is only defined mod 180: omega = 180 (through-line
-            # horizontal but beta-arm points the opposite way) is the SAME line as
-            # omega = 0, so fold it back. This merges mirror-image horizontal nodes.
-            _omega = round(_omega) % 180
-            return "3-panel-asymY-%s-%s" % (_afmt(round(min_gap)),
-                                            _afmt(round(_omega)))
+            return "3-panel-asymY-%s" % _afmt(round(min_gap))
         return "3-panel-Y-%s" % _afmt(round(min_gap))
 
     if n == 4:
@@ -2461,7 +2623,35 @@ def detect_grid_patterns_robust(img, prune_length=4):
     shape_counts = consolidate_shape_angles(shape_counts, node_records)
 
     # ---- crashworthiness numbers (RT membrane energy, RG complexity, Omega) ----
-    _skel_len_px = analytical_skeleton_length_px(skeleton, detected_circles)
+    # Total wall length is measured by the 8-adjacency pixel-count method: it sums
+    # orthogonal (=1) and diagonal (=sqrt2) skeleton steps and drops redundant
+    # staircase diagonals, so straight AND curved walls are measured at their true
+    # length. Validated on squares (S1=300, S2=450, S4=512) AND circular tubes
+    # (C14, C20, C22 within ~1%). The earlier analytical r*angle arc method
+    # systematically under-measured circular arcs by ~5%.
+    _skel_len_px = skeleton_length_px(skeleton)
+    # For the 'circle inscribed in a polygon' composite (e.g. O2, S15) the circle
+    # is tangent to every polygon edge, and skeletonisation merges the two walls
+    # at each tangent point, under-measuring the length. Rebuild the outer walls
+    # from the clean detected primitives when that exact geometry is present.
+    _recon_len = composite_reconstruct_len_px(skeleton, detected_circles, shape_type)
+    if _recon_len is None:
+        # near-pure circle packing (e.g. C1, C14): measure circles from a
+        # least-squares fit (exact 2*pi*r) instead of the pixel count, which
+        # over-measures smooth curves.
+        _recon_len = circle_packing_len_px(skeleton, detected_circles)
+    if _recon_len is None:
+        # isolated circle(s) + straight walls (e.g. C3, C4, C10): measure the
+        # circle exactly (2*pi*r) and the straight walls end-to-end, so the
+        # circle's staircase over-measurement is removed.
+        _recon_len = isolated_circle_len_px(skeleton, detected_circles)
+    if _recon_len is None and not detected_circles and shape_type in ("Quadrilateral", "Hexagon"):
+        # plain square / hexagon sections (straight walls, no circles): measure
+        # each wall end-to-end (analytic) so the slanted edges are not
+        # over-measured by the pixel staircase.
+        _recon_len = analytic_polygon_len_px(skeleton)
+    if _recon_len is not None:
+        _skel_len_px = _recon_len
     _outer_area_px = enclosed_area_px(skeleton, float(cv2.contourArea(main_contour)))
     _en = _energy.compute_energy(shape_counts, total_circles_found)
     _RT = _en["RT"]
