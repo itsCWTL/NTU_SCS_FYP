@@ -25,6 +25,7 @@ import re
 CIRCLE_ENERGY = 8.0 * math.pi          # = 25.1327...
 
 
+# convert degree to rad
 def _t(deg):
     return math.tan(math.radians(deg))
 

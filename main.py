@@ -1579,6 +1579,15 @@ def detect_corner_nodes(skeleton, existing, circles=None, circle_tol=12,
 def _afmt(a):
     return ("%g" % a)
 
+
+def _snap_canon(a, canon=(45.0, 60.0, 90.0, 120.0, 135.0), tol=2.0):
+    """Snap a measured angle to the nearest canonical design angle when it is
+    within `tol` degrees; otherwise leave it unchanged. Removes the 1-degree
+    pixel-discretisation bias that makes a 60-degree honeycomb k-junction read
+    as 59. A genuinely non-canonical angle (e.g. 68) is left alone."""
+    best = min(canon, key=lambda c: abs(c - a))
+    return best if abs(best - a) <= tol else a
+
 def classify_node_shape(dirs, straight, degree=None, on_circle=False, wedge_angs=None,
                         marker_circle=False):
     """Classify a junction into the taxonomy type name, e.g. '2-panel-90',
@@ -1772,7 +1781,7 @@ def classify_node_shape(dirs, straight, degree=None, on_circle=False, wedge_angs
                 _claw = (sum(_cg) / 2.0) if (_cg[1] - _cg[0]) <= 8.0 else _cg[1]
                 return "4-panel-(3claw%s+1)" % _afmt(round(_claw))
             # a genuine straight line (~180) + two arms symmetric on one side = k
-            return "4-panel-k-%s" % _afmt(round(min_gap))
+            return "4-panel-k-%s" % _afmt(round(_snap_canon(min_gap)))
         if through >= 2:                            # two lines crossing (no 180 panel)
             # X panels alternate small/large (e.g. 45/135/45/135). Label by the
             # AVERAGE of the two small (opposite) panels, so the value matches the
@@ -2363,6 +2372,49 @@ def detect_grid_patterns_robust(img, prune_length=4):
         scy, scx = snap_to_skeleton(skeleton, cy, cx, max(10, img_diag // 70))
         arms = get_arm_directions(scy, scx)
 
+        # --- Fixed-radii tangent for circular arms --------------------------
+        # For an arm that follows a detected circle, replace its noisy per-arm
+        # SVD tangent with the exact chord direction implied by the fitted
+        # circle: the node tangent leaned toward the circle centre by L/(2r)
+        # (L = traced arc length, r = radius). Symmetric arc nodes (e.g. C14)
+        # then give symmetric, noise-free angles. Straight-wall arms follow no
+        # circle and are left unchanged.
+        if detected_circles and arms:
+            _ctol = max(6, img_diag // 110)
+            _fixed = []
+            for (_d, _p) in arms:
+                _best = None; _beston = 0.0
+                for (_ccx, _ccy, _cr) in detected_circles:
+                    if _cr <= 1e-6:
+                        continue
+                    _on = 0
+                    for (_r, _c) in _p:
+                        if abs(math.hypot(_c - _ccx, _r - _ccy) - _cr) < _ctol:
+                            _on += 1
+                    if _on >= 0.6 * len(_p) and _on > _beston:
+                        _beston = _on; _best = (_ccx, _ccy, _cr)
+                if _best is not None:
+                    _ccx, _ccy, _cr = _best
+                    _ux, _uy = scx - _ccx, scy - _ccy
+                    _un = math.hypot(_ux, _uy)
+                    if _un > 1e-6:
+                        _ux, _uy = _ux / _un, _uy / _un
+                        _tx, _ty = -_uy, _ux
+                        _sgn = 1.0 if (_d[0] * _tx + _d[1] * _ty) >= 0 else -1.0
+                        _L = 0.0
+                        for _k in range(1, len(_p)):
+                            _L += math.hypot(_p[_k][0] - _p[_k - 1][0],
+                                             _p[_k][1] - _p[_k - 1][1])
+                        _th = _L / (2.0 * _cr)
+                        _nx = _sgn * math.cos(_th) * _tx - math.sin(_th) * _ux
+                        _ny = _sgn * math.cos(_th) * _ty - math.sin(_th) * _uy
+                        _nn = math.hypot(_nx, _ny)
+                        if _nn > 1e-6:
+                            _d = (_nx / _nn, _ny / _nn)
+                _fixed.append((_d, _p))
+            arms = _fixed
+        # --------------------------------------------------------------------
+
         # A node lying on TWO circles with no straight line through it is a
         # circle-circle meeting point (a "lens"): one degree-4 circle marker.
         _chord = has_straight_chord(scx, scy, arms)
@@ -2774,4 +2826,3 @@ def detect(img, min_dimension=900):
 
     result = detect_grid_patterns_robust(img)
     return result
-
