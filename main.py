@@ -1,12 +1,15 @@
 import cv2
 import numpy as np
-import matplotlib.pyplot as plt
 from skimage.morphology import skeletonize
 import math
-import hashlib
 import re
 import energy as _energy
 import geometry as _geometry
+
+
+# ============================================================
+# ELEMENT COLOUR
+# ============================================================
 
 def assign_shape_colors(names):
     """Give every distinct shape name its own DISTINCT colour by spreading hues
@@ -25,12 +28,126 @@ def assign_shape_colors(names):
         _out[_nm] = (int(_b[0]), int(_b[1]), int(_b[2]))
     return _out
 
+# ============================================================
+# NUMERIC TEMPLATE EXTRACTION FROM ELEMENT LABELS
+# ============================================================
+
+_NUM_RE = re.compile(r"\d+(?:\.\d+)?")
+
+
+def _numeric_template(name):
+    """Replace every number in a name with a placeholder and return
+    (template, tuple_of_numbers). '4-panel-(3claw46+1)' ->
+    ('\\x00-panel-(\\x00claw\\x00+\\x00)', (4.0, 3.0, 46.0, 1.0)). Two shapes
+    with the same template are the same element differing only in their numbers."""
+    nums = []
+
+    def _repl(m):
+        nums.append(float(m.group()))
+        return "\x00"
+
+    return _NUM_RE.sub(_repl, name), tuple(nums)
+
+# ============================================================
+# ELEMENT LABEL CONSOLIDATION BY ANGLE CLUSTERING
+# ============================================================
+
+def consolidate_shape_angles(shape_counts, node_records, tol=5.0):
+    """Merge shapes of the SAME element whose measured angles are close, accounting 
+    for measurement noise at symmetric nodes. Examples include 4-cir-k-31/32 and 4-panel-(3claw45/46+1).
+    Shapes are grouped by their numeric template (identical structure with numbers removed), 
+    then clustered when all corresponding numbers differ by no more than tol=5.0. 
+    Each cluster is assigned a representative label by replacing each numeric position with 
+    its count-weighted MEAN."""
+
+    groups = {}
+    for _sh, _cnt in shape_counts.items():
+        _tmpl, _nums = _numeric_template(_sh)
+        if not _nums:
+            continue
+        groups.setdefault(_tmpl, []).append((_nums, _cnt, _sh))
+
+    remap = {}
+    for _tmpl, _items in groups.items():
+        #labels merge if only if their first number is the same 
+        #difference of remaining values cannot more than tol
+        #single-linkage clustering: If A is close enough to B, 
+        #and B is close enough to C, all three can end up in one 
+        #cluster even if A and C differ by more than 5.
+        _n = len(_items)
+        _parent = list(range(_n))
+
+        def _find(_a):
+            while _parent[_a] != _a:
+                _parent[_a] = _parent[_parent[_a]]
+                _a = _parent[_a]
+            return _a
+
+        for _i in range(_n):
+            for _j in range(_i + 1, _n):
+                _ni, _nj = _items[_i][0], _items[_j][0]
+                if (_ni[0] == _nj[0] and
+                        all(abs(a - b) <= tol for a, b in zip(_ni[1:], _nj[1:]))):
+                    _ra, _rb = _find(_i), _find(_j)
+                    if _ra != _rb:
+                        _parent[_rb] = _ra
+
+        _clusters = {}
+        for _i in range(_n):
+            _clusters.setdefault(_find(_i), []).append(_items[_i])
+
+        for _cl in _clusters.values():
+            if len(_cl) < 2:
+                continue
+            _tot = sum(c for _, c, _ in _cl)
+            _reps = []
+            for _p in range(len(_cl[0][0])):
+                _reps.append(round(sum(n[_p] * c for n, c, _ in _cl) / _tot))
+            _newname = _tmpl
+            for _v in _reps:
+                _newname = _newname.replace("\x00", _afmt(_v), 1)
+            for _nums, _c, _name in _cl:
+                if _name != _newname:
+                    remap[_name] = _newname
+
+    if not remap:
+        return shape_counts
+    for _rec in node_records:
+        if _rec["shape"] in remap:
+            _rec["shape"] = remap[_rec["shape"]]
+    new_counts = {}
+    for _sh, _cnt in shape_counts.items():
+        _k = remap.get(_sh, _sh)
+        new_counts[_k] = new_counts.get(_k, 0) + _cnt
+    return new_counts
+
+# ============================================================
+# convert float to string 
+# ============================================================
+
+def _afmt(a):
+    """convert float to string with no trailing zeros, e.g. 3.0 -> '3', 3.5 -> '3.5'"""
+    return ("%g" % a)
+
+# ============================================================
+# nosie correction: canonical angle snapping
+# ============================================================
+def _snap_canon(a, canon=(45.0, 60.0, 90.0, 120.0, 135.0), tol=2.0):
+    """Snap a measured angle to the nearest canonical design angle when it is
+    within `tol` degrees; otherwise leave it unchanged. Removes the 1-degree
+    pixel-discretisation bias"""
+    best = min(canon, key=lambda c: abs(c - a))
+    return best if abs(best - a) <= tol else a
+
+
+# ============================================================
+# LENGTH & AREA MEASUREMENT 
+# ============================================================
 
 def skeleton_length_px(skel):
-    """Total drawn length of a 1-pixel skeleton, in pixels. Sums the 8-adjacency
+    """Calculate the total length (px) of a 1-pixel skeleton. Sums the 8-adjacency
     edges (orthogonal = 1, diagonal = sqrt2) and drops redundant diagonals in a
-    staircase so 45-degree / curved lines are measured at their true length
-    (validated on S1=300, S2=450, S4=512 to <1%)."""
+    staircase so 45-degree / curved lines are measured at their true length."""
     ys, xs = np.where(skel)
     S = set(zip(ys.tolist(), xs.tolist()))
     Lo = 0
@@ -47,31 +164,15 @@ def skeleton_length_px(skel):
     return Lo + Ld * math.sqrt(2.0)
 
 
-def enclosed_area_px(skel, fallback_area=0.0):
-    """Area (px^2) enclosed by the OUTER skeleton loop -- i.e. bounded by the wall
-    CENTRE-LINES, the same place the length is measured. Flood-fills the exterior
-    from a corner; a 4-connected flood cannot cross the 8-connected skeleton, so
-    the outer loop is a solid barrier. Measuring area at the centre-line (not the
-    thick outer edge) removes the stroke-width bias (S2 -> 450.0, S4 -> 512.05).
-    Falls back to fallback_area if the outer loop is open and the fill leaks in."""
-    h, w = skel.shape
-    free = (skel == 0).astype(np.uint8)
-    mask = np.zeros((h + 2, w + 2), np.uint8)
-    cv2.floodFill(free, mask, (0, 0), 2)          # 4-connected exterior fill
-    enclosed = h * w - int((free == 2).sum())
-    if fallback_area > 0 and enclosed < 0.5 * fallback_area:
-        return float(fallback_area)
-    return float(enclosed)
-
-
 def analytic_polygon_len_px(skel, dp_eps=2.0):
-    """Total length of a straight-walled (polygon) section measured the ANALYTIC
-    way: split the skeleton into node-to-node segments and closed loops, and
-    measure each by endpoint / Douglas-Peucker distance rather than by pixel
-    steps. On a slanted wall (e.g. the 60-degree edges of a hexagon) the pixel
-    step count follows a staircase that is slightly longer than the real edge, so
-    it OVER-measures; endpoint distance gives the true straight length at any
-    angle. Intended for square / hexagon sections that have no circles."""
+    """Calculate the total length (px) of a polygon-like skeleton.
+    Traces paths between endpoints and junctions, and identifies closed loops.
+    Simplifies each path using the Douglas-Peucker algorithm before summing
+    the Euclidean lengths of the resulting line segments. This reduces the
+    overestimation caused by pixel staircases along straight, slanted walls.
+    `dp_eps` controls the simplification tolerance in pixels. Intended for
+    straight-walled polygon sections without circular features.  
+    """
     ys, xs = np.where(skel > 0)
     S = set(zip(ys.tolist(), xs.tolist()))
     if not S:
@@ -93,7 +194,7 @@ def analytic_polygon_len_px(skel, dp_eps=2.0):
         if len(path) < 2:
             return 0.0
         pts = np.array([[c, r] for r, c in path], dtype=np.int32).reshape(-1, 1, 2)
-        ap = [tuple(x[0]) for x in cv2.approxPolyDP(pts, dp_eps, closed)]
+        ap = [tuple(x[0]) for x in cv2.approxPolyDP(pts, dp_eps, closed)] # Douglas-Peucker distance
         rng = range(len(ap)) if closed else range(1, len(ap))
         return sum(math.hypot(ap[i][0] - ap[i - 1][0], ap[i][1] - ap[i - 1][1])
                    for i in rng)
@@ -146,19 +247,13 @@ def composite_reconstruct_len_px(skel, circles, shape_type):
     TANGENT to every polygon edge at its mid-point. At each tangent point the
     circle and the straight edge come closer than the wall thickness, so the
     skeleton merges them into a single centre-line and the total length is
-    under-measured (O2 by ~7%).
+    under-measured.
 
-    Where this exact geometry is detected, the outer walls are rebuilt from the
-    clean detected primitives instead of the tangled skeleton:
+        length = 2*pi*r  +  polygon perimeter  +  spokes (centre -> vertex)
 
-        length = 2*pi*r  +  polygon perimeter  +  N spokes (centre -> vertex)
-
-    Returns the reconstructed length in pixels, or None when the section is NOT
-    this composite (so the normal pixel-count length is kept unchanged). The
-    trigger is deliberately strict -- a detected circle whose radius equals the
-    polygon's in-radius (tangent to the edges), vertices that poke out past the
-    circle, and N verified radial spokes -- so it fires only on this family and
-    leaves every other section untouched."""
+    Calculates the length as the circle circumference, polygon perimeter,
+    and total centre-to-vertex spoke length. Returns None if the checks
+    fail, allowing the normal skeleton-length method to be used instead."""
     if not circles or shape_type not in ("Quadrilateral", "Hexagon", "Octagon"):
         return None
     N = EXPECTED_SIDES.get(shape_type, -1)
@@ -195,22 +290,25 @@ def composite_reconstruct_len_px(skel, circles, shape_type):
 
 
 def circle_packing_len_px(skel, circles):
-    """Length correction for a section whose walls are (almost) all circles --
-    e.g. the plain circular tube C1 or a tangent circle-packing like C14. The
-    8-connected pixel count OVER-measures a smooth circle by ~5% (the staircase
-    of the digitised curve is longer than the true arc), while tangent contacts
-    between packed circles LOSE a little length where the skeleton merges them.
-    Both errors are removed by measuring each circle from a least-squares fit to
-    its own skeleton pixels and using its exact circumference 2*pi*r.
-
+    """The pixel-based method tends to overestimate smooth circular lengths due to 
+    digitisation (the staircase of the digitised curve is longer than the true arc), 
+    while merged skeletons at tangent contacts may cause slight length loss.
+    
+    Reconstruct the total length (px) of a skeleton dominated by circular
+    features. Refits each detected circle using least squares to estimate
+    its circumference, then adds the remaining non-circle skeleton length.
+    
+        length = sum(2*pi*r_i for each circle) + length of non-circle skeleton
+    
     Applied ONLY when at least 92% of the skeleton lies on detected circles (a
-    near-pure circle packing); a mixed circle+straight section keeps the ordinary
-    pixel-count length, because separating the straight walls from the circles is
-    not clean enough there. Returns the reconstructed length in px, or None."""
+    near-pure circle packing); For sections containing a mixture of circular and 
+    straight walls, the standard skeleton-length method is retained because reliably 
+    separating the two types of segments is difficult. Returns the reconstructed 
+    length in pixels, or None if the correction criteria are not met"""
     if not circles:
         return None
     ys, xs = np.where(skel > 0)
-    if len(ys) < 20:
+    if len(ys) < 20: # too few pixels to fit a circle reliably
         return None
     fx = xs.astype(np.float64)
     fy = ys.astype(np.float64)
@@ -219,7 +317,7 @@ def circle_packing_len_px(skel, circles):
     for (cx, cy, r) in circles:
         sel = np.abs(np.hypot(fx - cx, fy - cy) - r) < max(4.0, 0.06 * r)
         on_circle |= sel
-        if int(sel.sum()) >= 20:                       # least-squares refit
+        if int(sel.sum()) >= 20: # least-squares refit
             px, py = fx[sel], fy[sel]
             A = np.c_[2 * px, 2 * py, np.ones(len(px))]
             b = px * px + py * py
@@ -239,14 +337,13 @@ def circle_packing_len_px(skel, circles):
 
 def isolated_circle_len_px(skel, circles, dp_eps=2.0):
     """Length for a section whose walls are STRAIGHT lines plus one or more
-    circles that do NOT touch each other (e.g. C3: a circle with an internal
-    cross; C4 / C10 / C16: a circle with an internal star). Plain step-counting
-    over-measures the circle by ~5% (its staircase is longer than the true arc),
-    and the pure-circle refit (circle_packing) does not apply because straight
-    walls are present. Here each full circle is measured by its exact 2*pi*r
-    (least-squares refit) and the straight walls are measured segment-by-segment
-    by endpoint distance (exact at any angle); segments that lie on a circle are
-    skipped so the circle is counted once.
+    circles that do NOT touch each other (most of the circular sections). 
+    Each circle is refitted to its skeleton pixels using least squares, and its 
+    circumference is calculated as 2πr. Straight segments are traced and simplified 
+    using the Douglas-Peucker algorithm, then measured by summing the Euclidean 
+    distances between consecutive points. 
+
+        length = 2*pi*r  +  non-circular paths
 
     Returns the length in px, or None when the section is NOT this case: no
     circles; any two circles tangent to one another (a packing, where the merged
@@ -366,105 +463,23 @@ def isolated_circle_len_px(skel, circles, dp_eps=2.0):
     return total
 
 
-_NUM_RE = re.compile(r"\d+(?:\.\d+)?")
+def enclosed_area_px(skel, fallback_area=0.0):
+    """Calculate the area (px^2) enclosed by the skeleton using flood-fill.
+    Flood-fills from a corner to identify the outside area. If the loop is
+    closed, the fill cannot enter the enclosed region."""
+    h, w = skel.shape
+    free = (skel == 0).astype(np.uint8) #1: background; 0: skeleton
+    mask = np.zeros((h + 2, w + 2), np.uint8)
+    cv2.floodFill(free, mask, (0, 0), 2)          # 4-connected exterior fill
+    enclosed = h * w - int((free == 2).sum()) 
+    if fallback_area > 0 and enclosed < 0.5 * fallback_area:
+        return float(fallback_area)
+    return float(enclosed)
 
 
-def _numeric_template(name):
-    """Replace every number in a name with a placeholder and return
-    (template, tuple_of_numbers). '4-panel-(3claw46+1)' ->
-    ('\\x00-panel-(\\x00claw\\x00+\\x00)', (4.0, 3.0, 46.0, 1.0)). Two shapes
-    with the same template are the same element differing only in their numbers."""
-    nums = []
-
-    def _repl(m):
-        nums.append(float(m.group()))
-        return "\x00"
-
-    return _NUM_RE.sub(_repl, name), tuple(nums)
-
-
-def consolidate_shape_angles(shape_counts, node_records, tol=5.0):
-    """Merge near-equal measured angles of the SAME element into one category
-    (symmetric nodes differing only by measurement noise), e.g. 4-cir-k-31/32,
-    5-crc-panel-(3T+2panel158/159/164), or 4-panel-(3claw45/46+1). Shapes are
-    grouped by their numeric TEMPLATE (identical except for the numbers they
-    contain), clustered when every corresponding number is within `tol`, and each
-    cluster is relabelled: each number position takes its most common value (mode;
-    ties -> count-weighted mean). Updates node_records in place; returns rebuilt
-    shape_counts."""
-    groups = {}
-    for _sh, _cnt in shape_counts.items():
-        _tmpl, _nums = _numeric_template(_sh)
-        if not _nums:
-            continue
-        groups.setdefault(_tmpl, []).append((_nums, _cnt, _sh))
-
-    remap = {}
-    for _tmpl, _items in groups.items():
-        # Single-linkage clustering (union-find over ALL pairs, not just
-        # neighbours in a sort): two labels are the same element when their FIRST
-        # number (the panel / element COUNT, e.g. the 4 in '4-panel') is IDENTICAL
-        # -- so a 2-panel never merges with a 4-panel -- and every other number
-        # (the measured angles) is within `tol`. Comparing all pairs means labels
-        # that differ in more than one number still merge, e.g. asymY-59-120 and
-        # asymY-60-120 (alpha 59 vs 60, same omega).
-        _n = len(_items)
-        _parent = list(range(_n))
-
-        def _find(_a):
-            while _parent[_a] != _a:
-                _parent[_a] = _parent[_parent[_a]]
-                _a = _parent[_a]
-            return _a
-
-        for _i in range(_n):
-            for _j in range(_i + 1, _n):
-                _ni, _nj = _items[_i][0], _items[_j][0]
-                if (_ni[0] == _nj[0] and
-                        all(abs(a - b) <= tol for a, b in zip(_ni[1:], _nj[1:]))):
-                    _ra, _rb = _find(_i), _find(_j)
-                    if _ra != _rb:
-                        _parent[_rb] = _ra
-
-        _clusters = {}
-        for _i in range(_n):
-            _clusters.setdefault(_find(_i), []).append(_items[_i])
-
-        for _cl in _clusters.values():
-            if len(_cl) < 2:
-                continue
-            _tot = sum(c for _, c, _ in _cl)
-            _reps = []
-            for _p in range(len(_cl[0][0])):
-                _cnts = {}
-                for _nums, _c, _ in _cl:
-                    _v = round(_nums[_p])
-                    _cnts[_v] = _cnts.get(_v, 0) + _c
-                _maxc = max(_cnts.values())
-                _modes = [v for v, c in _cnts.items() if c == _maxc]
-                if len(_modes) == 1:
-                    _reps.append(_modes[0])
-                else:
-                    _reps.append(round(sum(n[_p] * c for n, c, _ in _cl) / _tot))
-            _newname = _tmpl
-            for _v in _reps:
-                _newname = _newname.replace("\x00", _afmt(_v), 1)
-            for _nums, _c, _name in _cl:
-                if _name != _newname:
-                    remap[_name] = _newname
-
-    if not remap:
-        return shape_counts
-    for _rec in node_records:
-        if _rec["shape"] in remap:
-            _rec["shape"] = remap[_rec["shape"]]
-    new_counts = {}
-    for _sh, _cnt in shape_counts.items():
-        _k = remap.get(_sh, _sh)
-        new_counts[_k] = new_counts.get(_k, 0) + _cnt
-    return new_counts
-
-#preprocessing
+# ============================================================
+# IMAGE PREPROCESSING
+# ============================================================
 
 def remove_small_components(binary_img, min_area_ratio=0.02):
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary_img)
@@ -483,6 +498,7 @@ def remove_small_components(binary_img, min_area_ratio=0.02):
             cleaned[labels == i] = 255
     return cleaned
 
+
 def remove_border_artifacts(binary_img, border_width=2, max_border_area_ratio=0.05):
     num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(binary_img)
     if num_labels <= 1:
@@ -491,7 +507,6 @@ def remove_border_artifacts(binary_img, border_width=2, max_border_area_ratio=0.
     largest_area = int(stats[1:, cv2.CC_STAT_AREA].max())
     max_removable = max_border_area_ratio * largest_area
 
-    h, w = binary_img.shape
     border_mask = np.zeros_like(binary_img, dtype=bool)
     border_mask[:border_width, :] = True
     border_mask[-border_width:, :] = True
@@ -506,6 +521,7 @@ def remove_border_artifacts(binary_img, border_width=2, max_border_area_ratio=0.
         if touches_border and is_small:
             cleaned[comp_mask] = 0
     return cleaned
+
 
 def preprocess_for_skeleton(img):
     if len(img.shape) == 3:
@@ -523,6 +539,7 @@ def preprocess_for_skeleton(img):
     binary = remove_small_components(binary, min_area_ratio=0.02)
     return binary
 
+
 def prune_skeleton_spurs(skeleton, min_branch_length=4):
     skel = skeleton.copy().astype(np.uint8)
     neighbor_kernel = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]], dtype=np.uint8)
@@ -533,6 +550,7 @@ def prune_skeleton_spurs(skeleton, min_branch_length=4):
             break
         skel = skel & ~endpoints
     return skel.astype(np.uint8)
+
 
 def prune_dead_end_branches(skeleton, max_dead_end_length=25):
     skel = skeleton.copy().astype(np.uint8)
@@ -582,8 +600,12 @@ def prune_dead_end_branches(skeleton, max_dead_end_length=25):
 
     return skel.astype(np.uint8)
 
+
+# ============================================================
+# OUTER SHAPE & VERTEX DETECTION
+# ============================================================
+
 def get_refined_shape(cnt):
-    area = cv2.contourArea(cnt)
     perimeter = cv2.arcLength(cnt, True)
     if perimeter == 0:
         return "Unknown", []
@@ -615,6 +637,7 @@ def get_refined_shape(cnt):
     shape_name = shape_map.get(num_v, f"Polygon ({num_v} sides)")
     return shape_name, vertices
 
+
 def detect_shape_vertices(binary_img, expected_sides=None):
     contours, _ = cv2.findContours(binary_img, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
     if not contours:
@@ -624,7 +647,6 @@ def detect_shape_vertices(binary_img, expected_sides=None):
     perimeter = cv2.arcLength(contour, True)
 
     if expected_sides is not None:
-        best_match = None
         best_match_diff = float('inf')
         vertices = []
         for epsilon_factor in [0.005, 0.01, 0.015, 0.02, 0.025, 0.03, 0.04, 0.05]:
@@ -632,7 +654,6 @@ def detect_shape_vertices(binary_img, expected_sides=None):
             diff = abs(len(approx) - expected_sides)
             if diff < best_match_diff:
                 best_match_diff = diff
-                best_match = approx
                 vertices = [tuple(p[0]) for p in approx]
             if len(approx) == expected_sides:
                 break
@@ -666,17 +687,19 @@ def detect_shape_vertices(binary_img, expected_sides=None):
         )
     return vertices
 
+
 EXPECTED_SIDES = {
     "Triangle": 3, "Quadrilateral": 4, "Pentagon": 5,
     "Hexagon": 6, "Heptagon": 7, "Octagon": 8,
 }
 
+
 # ============================================================
-# NEW HELPERS (node-detection improvements)
+# CIRCLE DETECTION & FITTING
 # ============================================================
 
 def detect_all_circles(binary, min_radius_px=10):
-    contours, hierarchy = cv2.findContours(binary, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
+    contours, _ = cv2.findContours(binary, cv2.RETR_CCOMP, cv2.CHAIN_APPROX_NONE)
     if not contours:
         return []
     out = []
@@ -718,6 +741,7 @@ def detect_all_circles(binary, min_radius_px=10):
             dedup.append((cx, cy, r))
     return dedup
 
+
 def _fit_circle_3pts(p1, p2, p3):
     ax, ay = p1
     bx, by = p2
@@ -733,6 +757,7 @@ def _fit_circle_3pts(p1, p2, p3):
           + (cx_ * cx_ + cy_ * cy_) * (bx - ax)) / d
     r = math.hypot(ax - ux, ay - uy)
     return (ux, uy, r)
+
 
 def ransac_circles_on_skeleton(skeleton, min_radius, max_radius,
                                num_iter=2500, inlier_dist=2.5,
@@ -797,6 +822,7 @@ def ransac_circles_on_skeleton(skeleton, min_radius, max_radius,
             
     return accepted
 
+
 def detect_all_circles_combined(binary, skeleton, gray_img, min_radius_px):
     H, W = skeleton.shape
     # FIX 1: Allow circles that stretch all the way to the image corners
@@ -850,11 +876,13 @@ def detect_all_circles_combined(binary, skeleton, gray_img, min_radius_px):
                     
     return combined
 
+
 def is_on_any_circle(x, y, circles, tol):
     for (cx, cy, r) in circles:
         if abs(math.hypot(x - cx, y - cy) - r) < tol:
             return True
     return False
+
 
 def snap_to_skeleton(skeleton, r, c, R):
     if 0 <= r < skeleton.shape[0] and 0 <= c < skeleton.shape[1] and skeleton[r, c]:
@@ -871,17 +899,258 @@ def snap_to_skeleton(skeleton, r, c, R):
                     best = (rr, cc)
     return best if best is not None else (r, c)
 
+
+def add_concentric_circles(skeleton, circles, min_r, step=4,
+                          cov_thresh=0.95, tol=5, samples=360):
+    """Find circles missed because they are concentric with another circle
+    (Hough suppresses same-centre circles via minDist). For every detected
+    centre, scan radii and keep any with near-full skeleton coverage."""
+    if not circles:
+        return circles
+    srcm = (skeleton == 0).astype(np.uint8)
+    dt = cv2.distanceTransform(srcm, cv2.DIST_L2, 3)
+    H, W = skeleton.shape
+
+    def cov(cx, cy, r):
+        hit = 0
+        for d in range(samples):
+            a = 2.0 * math.pi * d / samples
+            px = int(round(cx + r * math.cos(a)))
+            py = int(round(cy + r * math.sin(a)))
+            if 0 <= px < W and 0 <= py < H and dt[py, px] < tol:
+                hit += 1
+        return hit / samples
+
+    out = list(circles)
+    # unique centres
+    centres = []
+    for (cx, cy, r) in circles:
+        if all((cx - ox) ** 2 + (cy - oy) ** 2 > 12 * 12 for ox, oy in centres):
+            centres.append((cx, cy))
+    for (cx, cy) in centres:
+        existing = [r for (ox, oy, r) in out
+                    if (cx - ox) ** 2 + (cy - oy) ** 2 <= 12 * 12]
+        rmax = int(max(existing)) if existing else 0
+        r = min_r
+        while r < rmax - 8:
+            if all(abs(r - er) >= 8 for er in existing) and cov(cx, cy, r) >= cov_thresh:
+                out.append((float(cx), float(cy), float(r)))
+                existing.append(r)
+            r += step
+    return out
+
+
+def _circle_tangent_misalign(skeleton, cx, cy, r, snap=4, win=5, step=6,
+                             dev_thresh=22.0):
+    """Fraction of the circumference where the local skeleton direction does
+    NOT run tangent to the circle. A real circle's skeleton is tangent
+    everywhere (~0); a circle fitted through straight grid edges only touches
+    tangentially at a few points, so it is high (~0.5). Returns -1 if too few
+    samples to judge.
+
+    Also returns the MISS fraction (of the full sweep, samples where no
+    skeleton pixel is even within `snap`) via the second return value: a
+    polygon circumscribing this candidate (vertices poking out past it) has
+    NO nearby skeleton for a wide angular band around each corner -- those
+    samples are silently skipped by the alignment ratio below (which only
+    looks at samples it COULD find), so a high miss fraction is itself a
+    strong "this is not a real circle" signal that the ratio alone misses."""
+    H, W = skeleton.shape
+    bad = 0; tot = 0; total_samples = 0; miss = 0
+    for d in range(0, 360, step):
+        total_samples += 1
+        a = math.radians(d)
+        px = cx + r * math.cos(a); py = cy + r * math.sin(a)
+        best = None; bd = snap + 0.5
+        for rr in range(-snap, snap + 1):
+            for cc in range(-snap, snap + 1):
+                yy = int(round(py)) + rr; xx = int(round(px)) + cc
+                if 0 <= yy < H and 0 <= xx < W and skeleton[yy, xx]:
+                    dd = math.hypot(cc, rr)
+                    if dd < bd:
+                        bd = dd; best = (xx, yy)
+        if best is None:
+            miss += 1
+            continue
+        bx, by = best; pts = []
+        for rr in range(-win, win + 1):
+            for cc in range(-win, win + 1):
+                yy = by + rr; xx = bx + cc
+                if 0 <= yy < H and 0 <= xx < W and skeleton[yy, xx]:
+                    pts.append((cc, rr))
+        if len(pts) < 4:
+            continue
+        P = np.asarray(pts, float); P -= P.mean(0)
+        try:
+            _, _, vt = np.linalg.svd(P, full_matrices=False)
+        except np.linalg.LinAlgError:
+            continue
+        sd = vt[0]
+        tan = (-math.sin(a), math.cos(a))
+        dot = max(0.0, min(1.0, abs(sd[0] * tan[0] + sd[1] * tan[1])))
+        tot += 1
+        if math.degrees(math.acos(dot)) > dev_thresh:
+            bad += 1
+    miss_frac = miss / total_samples if total_samples else 1.0
+    if tot < 20:
+        return -1.0, miss_frac
+    return bad / tot, miss_frac
+
+
+def _circle_shape_ok(skeleton, cx, cy, r, max_miss_frac=0.05):
+    """True if the candidate's skeleton really behaves like a circle.
+    Rejects: grid-inscribed circles (high tangent misalignment) and polygon
+    rings (many vertices). A genuine circle is tangent everywhere with few
+    sharp turns; rings that pass through other shapes (real) keep a low
+    vertex count even if misalignment is slightly raised.
+
+    Also rejects a polygon whose vertices poke out past this candidate: a
+    wide angular band around each such corner has NO skeleton pixel near the
+    candidate's own radius (the tight, un-widened snap search misses it
+    entirely rather than flagging misalignment), so a high MISS fraction over
+    the sweep is itself proof this isn't a real circle everywhere, even when
+    the misalignment ratio computed only from the samples that DID find a
+    match looks deceptively low.
+
+    max_miss_frac must be loosened by a caller whose candidate is KNOWN to be
+    legitimately gap-heavy -- e.g. a big ring that passes behind several
+    smaller circles/spokes drawn over it (find_center_rings) is missing real
+    skeleton over a wide swath even though it is a genuine circle, which the
+    default (tuned for a fully-drawn circle) would wrongly reject."""
+    ma, miss_frac = _circle_tangent_misalign(skeleton, cx, cy, r)
+    if miss_frac > max_miss_frac:
+        return False
+    if ma > 0.30:
+        return False
+    vc = _circle_vertex_count(skeleton, cx, cy, r)
+    # graded: more vertices => require lower misalignment to accept
+    if vc >= 10 and ma >= 0.12:
+        return False
+    if vc >= 9 and ma >= 0.18:
+        return False
+    return True
+
+
+def _circle_vertex_count(skeleton, cx, cy, r, snap=6, step=4, turn_thresh=22):
+    """Count sharp turns (vertices) of the skeleton around a candidate circle.
+    A real circle curves smoothly (few turns); a polygon ring of straight
+    edges (e.g. a hexagon of triangle edges) has many turns."""
+    H, W = skeleton.shape
+    pts = []
+    for d in range(0, 360, step):
+        a = math.radians(d)
+        px = cx + r * math.cos(a); py = cy + r * math.sin(a)
+        best = None; bd = snap + 0.5
+        for rr in range(-snap, snap + 1):
+            for cc in range(-snap, snap + 1):
+                yy = int(round(py)) + rr; xx = int(round(px)) + cc
+                if 0 <= yy < H and 0 <= xx < W and skeleton[yy, xx]:
+                    dd = math.hypot(cc, rr)
+                    if dd < bd:
+                        bd = dd; best = (xx, yy)
+        pts.append(best)
+    valid = [p for p in pts if p is not None]
+    if len(valid) < 8:
+        return 99
+    turns = 0; n = len(valid)
+    for i in range(n):
+        a = valid[i - 1]; bp = valid[i]; c = valid[(i + 1) % n]
+        v1 = (bp[0] - a[0], bp[1] - a[1]); v2 = (c[0] - bp[0], c[1] - bp[1])
+        n1 = math.hypot(*v1); n2 = math.hypot(*v2)
+        if n1 < 2 or n2 < 2:
+            continue
+        dot = max(-1.0, min(1.0, (v1[0] * v2[0] + v1[1] * v2[1]) / (n1 * n2)))
+        if math.degrees(math.acos(dot)) > turn_thresh:
+            turns += 1
+    return turns
+
+
+def _circle_coverage(dt, H, W, cx, cy, r, tol, samples=720):
+    hit = 0
+    for d in range(samples):
+        a = 2.0 * math.pi * d / samples
+        px = int(round(cx + r * math.cos(a)))
+        py = int(round(cy + r * math.sin(a)))
+        if 0 <= px < W and 0 <= py < H and dt[py, px] < tol:
+            hit += 1
+    return hit / samples
+
+
+def _refine_circle_fit(skeleton, cx, cy, r, tol=8):
+    """Least-squares refit of (cx,cy,r) using skeleton points already close to
+    the initial estimate. A Hough/RANSAC/contour candidate is often correct in
+    shape but off by a handful of px in centre/radius (e.g. from an
+    anti-aliased or slightly hand-drawn circle) -- just enough to fail the
+    strict cov_thresh=0.95 coverage check below at tol=5, wrongly rejecting a
+    genuine circle. Tightening the fit first (same lstsq technique already
+    used for LENGTH measurement in circle_packing_len_px) fixes that without
+    loosening the coverage threshold itself."""
+    ys, xs = np.where(skeleton > 0)
+    if len(xs) == 0:
+        return cx, cy, r
+    fx = xs.astype(np.float64); fy = ys.astype(np.float64)
+    d = np.abs(np.hypot(fx - cx, fy - cy) - r)
+    sel = d < tol
+    if int(sel.sum()) < 20:
+        return cx, cy, r
+    px, py = fx[sel], fy[sel]
+    A = np.c_[2 * px, 2 * py, np.ones(len(px))]
+    b = px * px + py * py
+    sol, *_ = np.linalg.lstsq(A, b, rcond=None)
+    ncx, ncy = float(sol[0]), float(sol[1])
+    nr = math.sqrt(max(0.0, sol[2] + ncx ** 2 + ncy ** 2))
+    return ncx, ncy, nr
+
+
+def filter_real_circles(skeleton, circles, cov_thresh=0.95, **_):
+    """Strict filter for circles used in NODE logic: keep only nearly fully
+    covered circles (clean drawn circles). Partial big rings are handled
+    separately for counting (find_center_rings)."""
+    if not circles:
+        return []
+    src = (skeleton == 0).astype(np.uint8)
+    dt = cv2.distanceTransform(src, cv2.DIST_L2, 3)
+    H, W = skeleton.shape
+    out = []
+    for (cx, cy, r) in circles:
+        rcx, rcy, rr = _refine_circle_fit(skeleton, cx, cy, r)
+        if (_circle_coverage(dt, H, W, rcx, rcy, rr, 5) >= cov_thresh
+                and _circle_shape_ok(skeleton, rcx, rcy, rr)):
+            out.append((rcx, rcy, rr))
+    return out
+
+
+def find_center_rings(skeleton, cx0, cy0, min_r, max_r, step=4):
+    """Find big concentric rings centred near (cx0,cy0) that the other circle
+    detectors miss (they are partly covered because they pass through the
+    smaller circles). Uses the curvature-based test so polygon outlines are
+    not mistaken for rings."""
+    src = (skeleton == 0).astype(np.uint8)
+    dt = cv2.distanceTransform(src, cv2.DIST_L2, 3)
+    H, W = skeleton.shape
+    out = []
+    r = min_r
+    while r <= max_r:
+        best = (-1.0, cx0, cy0)
+        for dcy in range(-8, 9, 4):
+            for dcx in range(-8, 9, 4):
+                c5 = _circle_coverage(dt, H, W, cx0 + dcx, cy0 + dcy, r, 5, samples=360)
+                if c5 > best[0]:
+                    best = (c5, cx0 + dcx, cy0 + dcy)
+        c5, bcx, bcy = best
+        if c5 >= 0.60:
+            c12 = _circle_coverage(dt, H, W, bcx, bcy, r, 12, samples=360)
+            if (c12 - c5) <= 0.08 and all(abs(r - rr) > 15 for (_, _, rr) in out):
+                out.append((bcx, bcy, r))
+                r += 20
+                continue
+        r += step
+    return out
+
+
 # ============================================================
-# JUNCTION REFINEMENT (straight-through-line aware)
+# JUNCTION / NODE DETECTION
 # ============================================================
-# Goals:
-#   * detect EVERY junction (never drop nodes)
-#   * a node where a STRAIGHT line passes through  -> SQUARE
-#   * a corner / circle-only / curved point         -> CIRCLE
-#   * the tight cluster of junctions that a tangent circle creates at
-#     one crossing (circle grazes an edge => 2-3 extra T-junctions a few
-#     dozen px apart) collapses to ONE node; genuine separate crossings
-#     and far-apart nodes stay separate.
 
 def _atomic_junctions(skeleton, dil=5):
     nk = np.array([[1, 1, 1], [1, 0, 1], [1, 1, 1]], dtype=np.uint8)
@@ -895,6 +1164,7 @@ def _atomic_junctions(skeleton, dil=5):
         sy, sx = snap_to_skeleton(skeleton, y, x, 8)
         pts.append((sx, sy))
     return pts
+
 
 def _ring_branch_count(skeleton, cx, cy, R):
     H, W = skeleton.shape
@@ -916,9 +1186,11 @@ def _ring_branch_count(skeleton, cx, cy, R):
         t -= 1
     return t
 
+
 def _atom_local_degree(skeleton, cx, cy, R=10):
     """Local crossing degree: 3 = T-junction, 4+ = real crossing."""
     return _ring_branch_count(skeleton, cx, cy, R)
+
 
 def _bfs_skeleton_path(skel, src, dst, blocked, limit):
     from collections import deque
@@ -950,6 +1222,7 @@ def _bfs_skeleton_path(skel, src, dst, blocked, limit):
                 q.append((rr, cc))
     return None
 
+
 def _segment_is_straight(path, thresh=0.012):
     if path is None or len(path) < 5:
         return False
@@ -966,147 +1239,21 @@ def _segment_is_straight(path, thresh=0.012):
         return True
     return (s[-1] / math.sqrt(len(pts)) / span) < thresh
 
-def _trace_arms_simple(skel, cy, cx, core=5, length=45):
-    H, W = skel.shape
-    visited = np.zeros_like(skel, bool)
-    for r in range(max(0, cy - core - 2), min(H, cy + core + 3)):
-        for c in range(max(0, cx - core - 2), min(W, cx + core + 3)):
-            if (r - cy) ** 2 + (c - cx) ** 2 <= core * core:
-                visited[r, c] = True
-    exits = []
-    for r in range(max(0, cy - core - 3), min(H, cy + core + 4)):
-        for c in range(max(0, cx - core - 3), min(W, cx + core + 4)):
-            d2 = (r - cy) ** 2 + (c - cx) ** 2
-            if d2 <= core * core or d2 > (core + 3) ** 2:
-                continue
-            if skel[r, c]:
-                exits.append((r, c))
-    ded = []
-    for (r, c) in exits:
-        if all((r - r2) ** 2 + (c - c2) ** 2 >= 4 for r2, c2 in ded):
-            ded.append((r, c))
-    arms = []
-    for (sr, sc) in ded:
-        if visited[sr, sc]:
-            continue
-        path = [(sr, sc)]; visited[sr, sc] = True
-        for _ in range(length):
-            pr, pc = path[-1]; best = None; bd = -1
-            for dr in (-1, 0, 1):
-                for dc in (-1, 0, 1):
-                    if dr == 0 and dc == 0:
-                        continue
-                    rr, cc = pr + dr, pc + dc
-                    if 0 <= rr < H and 0 <= cc < W and skel[rr, cc] and not visited[rr, cc]:
-                        d = (rr - cy) ** 2 + (cc - cx) ** 2
-                        if d > bd:
-                            bd = d; best = (rr, cc)
-            if best is None:
-                break
-            visited[best] = True; path.append(best)
-        if len(path) >= 4:
-            er, ec = path[-1]; dx = ec - cx; dy = er - cy; nrm = math.hypot(dx, dy)
-            if nrm > 1:
-                pts = np.array([[c, r] for r, c in path], float)
-                span = math.hypot(pts[-1, 0] - pts[0, 0], pts[-1, 1] - pts[0, 1])
-                straight = True
-                if span >= 6 and len(pts) >= 5:
-                    m = pts.mean(0); cen = pts - m
-                    try:
-                        _, s, _ = np.linalg.svd(cen, full_matrices=False)
-                        straight = (s[-1] / math.sqrt(len(pts)) / span) < 0.06
-                    except np.linalg.LinAlgError:
-                        straight = True
-                arms.append(((dx / nrm, dy / nrm), straight))
-    return arms
 
-def _node_has_straight_arm(skel, cx, cy, circles, tol, core=5, length=40):
-    """True if a STRAIGHT arm (a spoke) leaves the node that does not run
-    along a detected circle. Used to tell a spoke-bearing ring corner from
-    a spoke-less circle-circle lens."""
-    H, W = skel.shape
-    sy, sx = snap_to_skeleton(skel, cy, cx, 12)
-    visited = np.zeros_like(skel, bool)
-    for r in range(max(0, sy - core - 2), min(H, sy + core + 3)):
-        for c in range(max(0, sx - core - 2), min(W, sx + core + 3)):
-            if (r - sy) ** 2 + (c - sx) ** 2 <= core * core:
-                visited[r, c] = True
-    exits = []
-    for r in range(max(0, sy - core - 3), min(H, sy + core + 4)):
-        for c in range(max(0, sx - core - 3), min(W, sx + core + 4)):
-            d2 = (r - sy) ** 2 + (c - sx) ** 2
-            if core * core < d2 <= (core + 3) ** 2 and skel[r, c]:
-                exits.append((r, c))
-    ded = []
-    for (r, c) in exits:
-        if all((r - r2) ** 2 + (c - c2) ** 2 >= 4 for r2, c2 in ded):
-            ded.append((r, c))
-    for (sr, sc) in ded:
-        if visited[sr, sc]:
-            continue
-        path = [(sr, sc)]; visited[sr, sc] = True
-        for _ in range(length):
-            pr, pc = path[-1]; best = None; bd = -1
-            for dr in (-1, 0, 1):
-                for dc in (-1, 0, 1):
-                    if dr == 0 and dc == 0:
-                        continue
-                    rr, cc = pr + dr, pc + dc
-                    if 0 <= rr < H and 0 <= cc < W and skel[rr, cc] and not visited[rr, cc]:
-                        d = (rr - sy) ** 2 + (cc - sx) ** 2
-                        if d > bd:
-                            bd = d; best = (rr, cc)
-            if best is None:
-                break
-            visited[best] = True; path.append(best)
-        if len(path) < 6:
-            continue
-        pts = np.array([[c, r] for r, c in path], float)
-        span = math.hypot(pts[-1, 0] - pts[0, 0], pts[-1, 1] - pts[0, 1])
-        if span < 8:
-            continue
-        m = pts.mean(0); cen = pts - m
-        try:
-            _, s, _ = np.linalg.svd(cen, full_matrices=False)
-            straight = (s[-1] / math.sqrt(len(pts)) / span) < 0.05
-        except np.linalg.LinAlgError:
-            straight = True
-        if not straight:
-            continue
-        on = 0
-        for (r, c) in path:
-            for (ccx, ccy, rr) in circles:
-                if abs(math.hypot(c - ccx, r - ccy) - rr) < tol:
-                    on += 1; break
-        if on < 0.6 * len(path):      # straight AND not a circle arc -> a spoke
+def _path_follows_circle(path, circles, tol):
+    """True if the BFS path linking two junction atoms runs almost entirely
+    along ONE detected circle. Used to catch a tangent/grazing circle that
+    scatters 2-3 extra T-junctions a short arc apart: they are connected by a
+    curved (not straight) segment, so _segment_is_straight misses them, but
+    they are still the same physical junction, just spread along the curve."""
+    if not path or not circles:
+        return False
+    for (cx, cy, r) in circles:
+        on = sum(1 for (r_, c_) in path
+                 if abs(math.hypot(c_ - cx, r_ - cy) - r) < tol)
+        if on >= 0.8 * len(path):
             return True
     return False
-
-
-def _has_straight_through(skel, cx, cy):
-    """True if two straight arms leave (cx,cy) in opposite (collinear)
-    directions -> a straight line passes through the node."""
-    sy, sx = snap_to_skeleton(skel, cy, cx, 12)
-    arms = _trace_arms_simple(skel, sy, sx)
-    sa = [a[0] for a in arms if a[1]]
-    for i in range(len(sa)):
-        for j in range(i + 1, len(sa)):
-            if sa[i][0] * sa[j][0] + sa[i][1] * sa[j][1] < -0.9:
-                return True
-    return False
-
-def _is_real_corner(skel, vx, vy):
-    """A genuine polygon corner: exactly two STRAIGHT edges meeting at an
-    angle. Rejects points lying on a smooth curve / circle (no corner)."""
-    sy, sx = snap_to_skeleton(skel, vy, vx, 15)
-    arms = _trace_arms_simple(skel, sy, sx)
-    if len(arms) != 2:
-        return False
-    if not (arms[0][1] and arms[1][1]):          # both arms must be straight
-        return False
-    d1, d2 = arms[0][0], arms[1][0]
-    dot = d1[0] * d2[0] + d1[1] * d2[1]
-    return dot > -0.95                            # a real bend, not a straight line
 
 
 def refine_junction_nodes(skeleton, max_link_dist=60, circles=None, circle_tol=12):
@@ -1141,6 +1288,34 @@ def refine_junction_nodes(skeleton, max_link_dist=60, circles=None, circle_tol=1
         atomcore[k] = s; allcore |= s
 
     md2 = max_link_dist * max_link_dist
+    # A circle tangent to a straight wall (e.g. a circle inscribed in a
+    # polygon, touching at each edge midpoint) can scatter its ONE tangency
+    # point into two T-junctions straddling the true contact point, well
+    # apart (the two walls stay within stroke-width of each other over a
+    # stretch near tangency, not just a few px) -- so a pair that both sit on
+    # the SAME detected circle AND is linked by a genuinely STRAIGHT wall
+    # gets a much longer leash than an ordinary tangency scatter.
+    circle_link_dist = max_link_dist * 4
+    circle_md2 = circle_link_dist * circle_link_dist
+    atom_circles = [frozenset(ci for ci, (ccx, ccy, rr) in enumerate(circles or [])
+                              if abs(math.hypot(x - ccx, y - ccy) - rr) < circle_tol)
+                    for (x, y) in atoms]
+    # A wide exclusion disk around every atom that sits on NO detected circle
+    # (e.g. a polygon corner just outside an inscribed circle). Two on-circle
+    # atoms from DIFFERENT tangent zones (different polygon edges) are joined
+    # only by routing past that corner -- the corner's own tiny 3px atomcore
+    # does not reliably block that route (the corner's own branch can sit just
+    # off the direct edge-to-edge line), so without a wider barrier here the
+    # long-leash straight-wall check below can bridge past it and, edge by
+    # edge, collapse every tangent zone around the whole circle into one.
+    off_circle_barrier = set()
+    barrier_r = max(10, circle_tol) * 3
+    for k, (x, y) in enumerate(atoms):
+        if not atom_circles[k]:
+            for dr in range(-barrier_r, barrier_r + 1):
+                for dc in range(-barrier_r, barrier_r + 1):
+                    if dr * dr + dc * dc <= barrier_r * barrier_r:
+                        off_circle_barrier.add((y + dr, x + dc))
     for i in range(n):
         # only T-junctions (deg<=3) can be tangency scatter of one node
         if deg[i] > 3:
@@ -1150,13 +1325,44 @@ def refine_junction_nodes(skeleton, max_link_dist=60, circles=None, circle_tol=1
             if deg[j] > 3:
                 continue
             xj, yj = atoms[j]
-            if (xi - xj) ** 2 + (yi - yj) ** 2 > md2:
-                continue
+            d2 = (xi - xj) ** 2 + (yi - yj) ** 2
             blocked = allcore - atomcore[i] - atomcore[j]
-            path = _bfs_skeleton_path(skeleton, (yi, xi), (yj, xj),
-                                      blocked, max_link_dist + 6)
-            if _segment_is_straight(path):
-                union(i, j)
+            if atom_circles[i] and atom_circles[j]:
+                blocked = blocked | (off_circle_barrier - atomcore[i] - atomcore[j])
+            merged = False
+            # An atom sitting ON some detected circle and an atom sitting on
+            # NONE of them must never auto-merge here, even if close and
+            # straight/circle-linked: that is not skeleton noise around one
+            # point, it is a genuinely different feature a short real wall
+            # segment away (e.g. a polygon corner just past where a spoke
+            # crosses an inscribed circle -- the corner sits ~20-30px outside
+            # the circle, well within reach of a short hop). Without this
+            # guard a single such hop can chain transitively all the way
+            # around a circle-in-polygon shape (each edge bridging one
+            # tangent zone to the next) and collapse the whole boundary into
+            # one bogus node.
+            circle_mismatch = bool(atom_circles[i]) != bool(atom_circles[j])
+            # 1) ordinary tangency scatter (straight OR curved connector),
+            #    kept at the SHORT radius -- a curved connector merely means
+            #    "the path runs along a circle", which is also true of the
+            #    long arc between two genuinely distinct junctions on the
+            #    same circle, so it must not get the long leash below.
+            if d2 <= md2 and not circle_mismatch:
+                path = _bfs_skeleton_path(skeleton, (yi, xi), (yj, xj),
+                                          blocked, max_link_dist + 6)
+                if _segment_is_straight(path) or _path_follows_circle(
+                        path, circles, circle_tol):
+                    union(i, j)
+                    merged = True
+            # 2) straight-wall tangent to a shared circle: the long leash,
+            #    but ONLY for a genuinely STRAIGHT connector (a flat wall) --
+            #    never merely circle-following, which would just be the
+            #    boundary arc between two distinct real junctions.
+            if not merged and d2 <= circle_md2 and (atom_circles[i] & atom_circles[j]):
+                path = _bfs_skeleton_path(skeleton, (yi, xi), (yj, xj),
+                                          blocked, circle_link_dist + 6)
+                if _segment_is_straight(path):
+                    union(i, j)
 
     groups = {}
     for i in range(n):
@@ -1169,6 +1375,17 @@ def refine_junction_nodes(skeleton, max_link_dist=60, circles=None, circle_tol=1
             cy = int(round(sum(atoms[i][1] for i in idxs) / len(idxs)))
             if _has_straight_through(skeleton, cx, cy):
                 nodes.append((cx, cy, 'through'))
+            elif circles and any(
+                    all(abs(math.hypot(atoms[i][0] - ccx, atoms[i][1] - ccy) - rr)
+                        < circle_tol for i in idxs)
+                    for (ccx, ccy, rr) in circles):
+                # every atom in this cluster lies on the SAME detected circle:
+                # a grazing tangency scatters several T-junctions along one
+                # short arc, but it is really ONE (big) node, not several
+                # separate corners -- collapse to a single node at the
+                # cluster centroid (mirrors the composite length reconstruction
+                # used for a circle tangent to a polygon, e.g. S15).
+                nodes.append((cx, cy, 'corner'))
             else:
                 for i in idxs:
                     nodes.append((atoms[i][0], atoms[i][1], 'corner'))
@@ -1358,195 +1575,6 @@ def degree_from_ring(skeleton, cx, cy, node_pts, hard_cap=75, rmin=14):
     return max(cand) if cand else max(counts)
 
 
-def add_concentric_circles(skeleton, circles, min_r, step=4,
-                          cov_thresh=0.95, tol=5, samples=360):
-    """Find circles missed because they are concentric with another circle
-    (Hough suppresses same-centre circles via minDist). For every detected
-    centre, scan radii and keep any with near-full skeleton coverage."""
-    if not circles:
-        return circles
-    srcm = (skeleton == 0).astype(np.uint8)
-    dt = cv2.distanceTransform(srcm, cv2.DIST_L2, 3)
-    H, W = skeleton.shape
-
-    def cov(cx, cy, r):
-        hit = 0
-        for d in range(samples):
-            a = 2.0 * math.pi * d / samples
-            px = int(round(cx + r * math.cos(a)))
-            py = int(round(cy + r * math.sin(a)))
-            if 0 <= px < W and 0 <= py < H and dt[py, px] < tol:
-                hit += 1
-        return hit / samples
-
-    out = list(circles)
-    # unique centres
-    centres = []
-    for (cx, cy, r) in circles:
-        if all((cx - ox) ** 2 + (cy - oy) ** 2 > 12 * 12 for ox, oy in centres):
-            centres.append((cx, cy))
-    for (cx, cy) in centres:
-        existing = [r for (ox, oy, r) in out
-                    if (cx - ox) ** 2 + (cy - oy) ** 2 <= 12 * 12]
-        rmax = int(max(existing)) if existing else 0
-        r = min_r
-        while r < rmax - 8:
-            if all(abs(r - er) >= 8 for er in existing) and cov(cx, cy, r) >= cov_thresh:
-                out.append((float(cx), float(cy), float(r)))
-                existing.append(r)
-            r += step
-    return out
-
-
-def _circle_tangent_misalign(skeleton, cx, cy, r, snap=4, win=5, step=6,
-                             dev_thresh=22.0):
-    """Fraction of the circumference where the local skeleton direction does
-    NOT run tangent to the circle. A real circle's skeleton is tangent
-    everywhere (~0); a circle fitted through straight grid edges only touches
-    tangentially at a few points, so it is high (~0.5). Returns -1 if too few
-    samples to judge."""
-    H, W = skeleton.shape
-    bad = 0; tot = 0
-    for d in range(0, 360, step):
-        a = math.radians(d)
-        px = cx + r * math.cos(a); py = cy + r * math.sin(a)
-        best = None; bd = snap + 0.5
-        for rr in range(-snap, snap + 1):
-            for cc in range(-snap, snap + 1):
-                yy = int(round(py)) + rr; xx = int(round(px)) + cc
-                if 0 <= yy < H and 0 <= xx < W and skeleton[yy, xx]:
-                    dd = math.hypot(cc, rr)
-                    if dd < bd:
-                        bd = dd; best = (xx, yy)
-        if best is None:
-            continue
-        bx, by = best; pts = []
-        for rr in range(-win, win + 1):
-            for cc in range(-win, win + 1):
-                yy = by + rr; xx = bx + cc
-                if 0 <= yy < H and 0 <= xx < W and skeleton[yy, xx]:
-                    pts.append((cc, rr))
-        if len(pts) < 4:
-            continue
-        P = np.asarray(pts, float); P -= P.mean(0)
-        try:
-            _, _, vt = np.linalg.svd(P, full_matrices=False)
-        except np.linalg.LinAlgError:
-            continue
-        sd = vt[0]
-        tan = (-math.sin(a), math.cos(a))
-        dot = max(0.0, min(1.0, abs(sd[0] * tan[0] + sd[1] * tan[1])))
-        tot += 1
-        if math.degrees(math.acos(dot)) > dev_thresh:
-            bad += 1
-    if tot < 20:
-        return -1.0
-    return bad / tot
-
-
-def _circle_shape_ok(skeleton, cx, cy, r):
-    """True if the candidate's skeleton really behaves like a circle.
-    Rejects: grid-inscribed circles (high tangent misalignment) and polygon
-    rings (many vertices). A genuine circle is tangent everywhere with few
-    sharp turns; rings that pass through other shapes (real) keep a low
-    vertex count even if misalignment is slightly raised."""
-    ma = _circle_tangent_misalign(skeleton, cx, cy, r)
-    if ma > 0.30:
-        return False
-    vc = _circle_vertex_count(skeleton, cx, cy, r)
-    # graded: more vertices => require lower misalignment to accept
-    if vc >= 10 and ma >= 0.12:
-        return False
-    if vc >= 9 and ma >= 0.18:
-        return False
-    return True
-
-
-def _circle_vertex_count(skeleton, cx, cy, r, snap=6, step=4, turn_thresh=22):
-    """Count sharp turns (vertices) of the skeleton around a candidate circle.
-    A real circle curves smoothly (few turns); a polygon ring of straight
-    edges (e.g. a hexagon of triangle edges) has many turns."""
-    H, W = skeleton.shape
-    pts = []
-    for d in range(0, 360, step):
-        a = math.radians(d)
-        px = cx + r * math.cos(a); py = cy + r * math.sin(a)
-        best = None; bd = snap + 0.5
-        for rr in range(-snap, snap + 1):
-            for cc in range(-snap, snap + 1):
-                yy = int(round(py)) + rr; xx = int(round(px)) + cc
-                if 0 <= yy < H and 0 <= xx < W and skeleton[yy, xx]:
-                    dd = math.hypot(cc, rr)
-                    if dd < bd:
-                        bd = dd; best = (xx, yy)
-        pts.append(best)
-    valid = [p for p in pts if p is not None]
-    if len(valid) < 8:
-        return 99
-    turns = 0; n = len(valid)
-    for i in range(n):
-        a = valid[i - 1]; bp = valid[i]; c = valid[(i + 1) % n]
-        v1 = (bp[0] - a[0], bp[1] - a[1]); v2 = (c[0] - bp[0], c[1] - bp[1])
-        n1 = math.hypot(*v1); n2 = math.hypot(*v2)
-        if n1 < 2 or n2 < 2:
-            continue
-        dot = max(-1.0, min(1.0, (v1[0] * v2[0] + v1[1] * v2[1]) / (n1 * n2)))
-        if math.degrees(math.acos(dot)) > turn_thresh:
-            turns += 1
-    return turns
-
-
-def _circle_coverage(dt, H, W, cx, cy, r, tol, samples=720):
-    hit = 0
-    for d in range(samples):
-        a = 2.0 * math.pi * d / samples
-        px = int(round(cx + r * math.cos(a)))
-        py = int(round(cy + r * math.sin(a)))
-        if 0 <= px < W and 0 <= py < H and dt[py, px] < tol:
-            hit += 1
-    return hit / samples
-
-def filter_real_circles(skeleton, circles, cov_thresh=0.95, **_):
-    """Strict filter for circles used in NODE logic: keep only nearly fully
-    covered circles (clean drawn circles). Partial big rings are handled
-    separately for counting (find_center_rings)."""
-    if not circles:
-        return []
-    src = (skeleton == 0).astype(np.uint8)
-    dt = cv2.distanceTransform(src, cv2.DIST_L2, 3)
-    H, W = skeleton.shape
-    return [(cx, cy, r) for (cx, cy, r) in circles
-            if _circle_coverage(dt, H, W, cx, cy, r, 5) >= cov_thresh
-            and _circle_shape_ok(skeleton, cx, cy, r)]
-
-def find_center_rings(skeleton, cx0, cy0, min_r, max_r, step=4):
-    """Find big concentric rings centred near (cx0,cy0) that the other circle
-    detectors miss (they are partly covered because they pass through the
-    smaller circles). Uses the curvature-based test so polygon outlines are
-    not mistaken for rings."""
-    src = (skeleton == 0).astype(np.uint8)
-    dt = cv2.distanceTransform(src, cv2.DIST_L2, 3)
-    H, W = skeleton.shape
-    out = []
-    r = min_r
-    while r <= max_r:
-        best = (-1.0, cx0, cy0)
-        for dcy in range(-8, 9, 4):
-            for dcx in range(-8, 9, 4):
-                c5 = _circle_coverage(dt, H, W, cx0 + dcx, cy0 + dcy, r, 5, samples=360)
-                if c5 > best[0]:
-                    best = (c5, cx0 + dcx, cy0 + dcy)
-        c5, bcx, bcy = best
-        if c5 >= 0.60:
-            c12 = _circle_coverage(dt, H, W, bcx, bcy, r, 12, samples=360)
-            if (c12 - c5) <= 0.08 and all(abs(r - rr) > 15 for (_, _, rr) in out):
-                out.append((bcx, bcy, r))
-                r += 20
-                continue
-        r += step
-    return out
-
-
 def detect_corner_nodes(skeleton, existing, circles=None, circle_tol=12,
                         min_dist=24, bend_dot=-0.85):
     """Find genuine degree-2 corners (a sharp bend where two straight edges
@@ -1576,17 +1604,162 @@ def detect_corner_nodes(skeleton, existing, circles=None, circle_tol=12,
     return found
 
 
-def _afmt(a):
-    return ("%g" % a)
+
+# ============================================================
+# ARM TRACING
+# ============================================================
+
+def _trace_arms_simple(skel, cy, cx, core=5, length=45):
+    H, W = skel.shape
+    visited = np.zeros_like(skel, bool)
+    for r in range(max(0, cy - core - 2), min(H, cy + core + 3)):
+        for c in range(max(0, cx - core - 2), min(W, cx + core + 3)):
+            if (r - cy) ** 2 + (c - cx) ** 2 <= core * core:
+                visited[r, c] = True
+    exits = []
+    for r in range(max(0, cy - core - 3), min(H, cy + core + 4)):
+        for c in range(max(0, cx - core - 3), min(W, cx + core + 4)):
+            d2 = (r - cy) ** 2 + (c - cx) ** 2
+            if d2 <= core * core or d2 > (core + 3) ** 2:
+                continue
+            if skel[r, c]:
+                exits.append((r, c))
+    ded = []
+    for (r, c) in exits:
+        if all((r - r2) ** 2 + (c - c2) ** 2 >= 4 for r2, c2 in ded):
+            ded.append((r, c))
+    arms = []
+    for (sr, sc) in ded:
+        if visited[sr, sc]:
+            continue
+        path = [(sr, sc)]; visited[sr, sc] = True
+        for _ in range(length):
+            pr, pc = path[-1]; best = None; bd = -1
+            for dr in (-1, 0, 1):
+                for dc in (-1, 0, 1):
+                    if dr == 0 and dc == 0:
+                        continue
+                    rr, cc = pr + dr, pc + dc
+                    if 0 <= rr < H and 0 <= cc < W and skel[rr, cc] and not visited[rr, cc]:
+                        d = (rr - cy) ** 2 + (cc - cx) ** 2
+                        if d > bd:
+                            bd = d; best = (rr, cc)
+            if best is None:
+                break
+            visited[best] = True; path.append(best)
+        if len(path) >= 4:
+            er, ec = path[-1]; dx = ec - cx; dy = er - cy; nrm = math.hypot(dx, dy)
+            if nrm > 1:
+                pts = np.array([[c, r] for r, c in path], float)
+                span = math.hypot(pts[-1, 0] - pts[0, 0], pts[-1, 1] - pts[0, 1])
+                straight = True
+                if span >= 6 and len(pts) >= 5:
+                    m = pts.mean(0); cen = pts - m
+                    try:
+                        _, s, _ = np.linalg.svd(cen, full_matrices=False)
+                        straight = (s[-1] / math.sqrt(len(pts)) / span) < 0.06
+                    except np.linalg.LinAlgError:
+                        straight = True
+                arms.append(((dx / nrm, dy / nrm), straight))
+    return arms
 
 
-def _snap_canon(a, canon=(45.0, 60.0, 90.0, 120.0, 135.0), tol=2.0):
-    """Snap a measured angle to the nearest canonical design angle when it is
-    within `tol` degrees; otherwise leave it unchanged. Removes the 1-degree
-    pixel-discretisation bias that makes a 60-degree honeycomb k-junction read
-    as 59. A genuinely non-canonical angle (e.g. 68) is left alone."""
-    best = min(canon, key=lambda c: abs(c - a))
-    return best if abs(best - a) <= tol else a
+def _node_has_straight_arm(skel, cx, cy, circles, tol, core=5, length=40):
+    """True if a STRAIGHT arm (a spoke) leaves the node that does not run
+    along a detected circle. Used to tell a spoke-bearing ring corner from
+    a spoke-less circle-circle lens."""
+    H, W = skel.shape
+    sy, sx = snap_to_skeleton(skel, cy, cx, 12)
+    visited = np.zeros_like(skel, bool)
+    for r in range(max(0, sy - core - 2), min(H, sy + core + 3)):
+        for c in range(max(0, sx - core - 2), min(W, sx + core + 3)):
+            if (r - sy) ** 2 + (c - sx) ** 2 <= core * core:
+                visited[r, c] = True
+    exits = []
+    for r in range(max(0, sy - core - 3), min(H, sy + core + 4)):
+        for c in range(max(0, sx - core - 3), min(W, sx + core + 4)):
+            d2 = (r - sy) ** 2 + (c - sx) ** 2
+            if core * core < d2 <= (core + 3) ** 2 and skel[r, c]:
+                exits.append((r, c))
+    ded = []
+    for (r, c) in exits:
+        if all((r - r2) ** 2 + (c - c2) ** 2 >= 4 for r2, c2 in ded):
+            ded.append((r, c))
+    for (sr, sc) in ded:
+        if visited[sr, sc]:
+            continue
+        path = [(sr, sc)]; visited[sr, sc] = True
+        for _ in range(length):
+            pr, pc = path[-1]; best = None; bd = -1
+            for dr in (-1, 0, 1):
+                for dc in (-1, 0, 1):
+                    if dr == 0 and dc == 0:
+                        continue
+                    rr, cc = pr + dr, pc + dc
+                    if 0 <= rr < H and 0 <= cc < W and skel[rr, cc] and not visited[rr, cc]:
+                        d = (rr - sy) ** 2 + (cc - sx) ** 2
+                        if d > bd:
+                            bd = d; best = (rr, cc)
+            if best is None:
+                break
+            visited[best] = True; path.append(best)
+        if len(path) < 6:
+            continue
+        pts = np.array([[c, r] for r, c in path], float)
+        span = math.hypot(pts[-1, 0] - pts[0, 0], pts[-1, 1] - pts[0, 1])
+        if span < 8:
+            continue
+        m = pts.mean(0); cen = pts - m
+        try:
+            _, s, _ = np.linalg.svd(cen, full_matrices=False)
+            straight = (s[-1] / math.sqrt(len(pts)) / span) < 0.05
+        except np.linalg.LinAlgError:
+            straight = True
+        if not straight:
+            continue
+        on = 0
+        for (r, c) in path:
+            for (ccx, ccy, rr) in circles:
+                if abs(math.hypot(c - ccx, r - ccy) - rr) < tol:
+                    on += 1; break
+        if on < 0.6 * len(path):      # straight AND not a circle arc -> a spoke
+            return True
+    return False
+
+
+def _has_straight_through(skel, cx, cy):
+    """True if two straight arms leave (cx,cy) in opposite (collinear)
+    directions -> a straight line passes through the node."""
+    sy, sx = snap_to_skeleton(skel, cy, cx, 12)
+    arms = _trace_arms_simple(skel, sy, sx)
+    sa = [a[0] for a in arms if a[1]]
+    for i in range(len(sa)):
+        for j in range(i + 1, len(sa)):
+            if sa[i][0] * sa[j][0] + sa[i][1] * sa[j][1] < -0.9:
+                return True
+    return False
+
+
+def _is_real_corner(skel, vx, vy):
+    """A genuine polygon corner: exactly two STRAIGHT edges meeting at an
+    angle. Rejects points lying on a smooth curve / circle (no corner)."""
+    sy, sx = snap_to_skeleton(skel, vy, vx, 15)
+    arms = _trace_arms_simple(skel, sy, sx)
+    if len(arms) != 2:
+        return False
+    if not (arms[0][1] and arms[1][1]):          # both arms must be straight
+        return False
+    d1, d2 = arms[0][0], arms[1][0]
+    dot = d1[0] * d2[0] + d1[1] * d2[1]
+    return dot > -0.95                            # a real bend, not a straight line
+
+
+
+
+
+# ============================================================
+# JUNCTION CLASSIFICATION 
+# ============================================================
 
 def classify_node_shape(dirs, straight, degree=None, on_circle=False, wedge_angs=None,
                         marker_circle=False):
@@ -1663,9 +1836,13 @@ def classify_node_shape(dirs, straight, degree=None, on_circle=False, wedge_angs
             #     (e.g. a pentagram point: 29 + 29 = 58).
             #   * Otherwise there is no wide arc gap and the corner opening IS the
             #     largest panel itself (e.g. a hexagon-type 120 corner).
-            _a5 = sorted(math.degrees(math.atan2(d[1], d[0])) % 360.0 for d in dirs)
-            _n5 = len(_a5)
-            _cyc5 = [(_a5[(i + 1) % _n5] - _a5[i]) % 360.0 for i in range(_n5)]
+            # Prefer the same `gaps` the rest of this function already uses
+            # (wedge_angs when given, i.e. the on-image corrected angles) --
+            # NOT a fresh recompute from the raw traced `dirs`, which are a
+            # CHORD approximation over the arc near a point-on-circle and
+            # drift a degree or two off true (e.g. 88+88=176 instead of the
+            # true, displayed 90+90=180).
+            _cyc5 = gaps
             _mx5 = max(_cyc5)
             if _mx5 >= 150.0:
                 # dominant arc gap -> the 3T is (2 arc arms + spoke). Remove it:
@@ -1858,12 +2035,18 @@ def classify_node_shape(dirs, straight, degree=None, on_circle=False, wedge_angs
         return "%d-panel-%s" % (n, _afmt(360.0 / n))   # regular star: 360/n
     return "%d-panel-%d" % (n, int(round(min_gap)))
 
+
+# ============================================================
+# MAIN DETECTION PIPELINE
+# ============================================================
+
 def detect_grid_patterns_robust(img, prune_length=4):
     if img is None:
         return None
     if len(img.shape) == 3:
         img = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
 
+    # ---- PHASE 1: preprocess the raw image into a clean 1px skeleton ----
     binary = preprocess_for_skeleton(img)
 
     raw_skel = skeletonize(binary // 255).astype(np.uint8)
@@ -1876,6 +2059,7 @@ def detect_grid_patterns_robust(img, prune_length=4):
                                                (line_thickness_est, line_thickness_est))
     binary = cv2.dilate(raw_skel * 255, rebuild_kernel)
 
+    # ---- PHASE 2: detect every circle in the figure ----
     img_h, img_w = img.shape
     detected_circles = detect_all_circles_combined(
         binary, raw_skel, img,  
@@ -1900,7 +2084,7 @@ def detect_grid_patterns_robust(img, prune_length=4):
         for (rx, ry, rr) in find_center_rings(
                 raw_skel, cxm, cym,
                 min_r=int(small_r * 1.6), max_r=int(max(img_h, img_w) * 0.5)):
-            if (_circle_shape_ok(raw_skel, rx, ry, rr) and
+            if (_circle_shape_ok(raw_skel, rx, ry, rr, max_miss_frac=0.6) and
                 all(abs(rr - c[2]) > max(10, 0.1 * rr) or
                     (rx - c[0]) ** 2 + (ry - c[1]) ** 2 > (0.2 * rr) ** 2
                     for c in detected_circles)):
@@ -1914,6 +2098,7 @@ def detect_grid_patterns_robust(img, prune_length=4):
         print("No contours found.")
         return None
 
+    # ---- PHASE 3: identify the outer shape type and its vertices ----
     main_contour = max(contours, key=cv2.contourArea)
     shape_type, shape_vertices = get_refined_shape(main_contour)
 
@@ -1928,9 +2113,8 @@ def detect_grid_patterns_robust(img, prune_length=4):
     img_diag = int(np.sqrt(img.shape[0] ** 2 + img.shape[1] ** 2))
     marker_radius = max(8, img_diag // 80)
     marker_thickness = max(2, img_diag // 400)
-    line_thickness = max(2, int(round(binary.sum() / 255 / max(raw_skel.sum(), 1))))
-    merge_kernel_size = max(7, img_diag // 70)
 
+    # ---- PHASE 4: detect every junction node ----
     # Junction nodes via straight-through-line aware refinement:
     #   straight pass-through chain -> ONE 'through' node (square)
     #   corner crossing            -> separate 'cross' nodes (circles)
@@ -1998,10 +2182,14 @@ def detect_grid_patterns_robust(img, prune_length=4):
         skeleton, _existing_pts, circles=detected_circles,
         circle_tol=max(10, img_diag // 70), min_dist=max(20, img_diag // 45))
 
+    # ---- PHASE 5: per-node measurement setup ----
+    # Output canvas, shared tolerances, and the nested helpers every node
+    # below draws on to trace its arms, count them, measure the wedge angle
+    # between each pair, and test straightness / circle-following.
     output_img = cv2.cvtColor(img, cv2.COLOR_GRAY2BGR)
     pattern_counts = {2: 0, 3: 0, 4: 0, 5: 0, 6: 0, 7: 0, 8: 0, 9: 0, 10: 0, 11: 0, 12: 0, "other": 0}
 
-    edge_tol = max(4, img_diag // 200)       
+    edge_tol = max(4, img_diag // 200)
     vertex_tol = max(20, img_diag // 30)      
     core_radius_px = max(4, img_diag // 120)    
     arm_trace_length = max(20, img_diag // 22)  
@@ -2035,6 +2223,9 @@ def detect_grid_patterns_robust(img, prune_length=4):
                 return True
         return False
 
+    # -- arm counting & measurement: trace every arm leaving a node and fit
+    # -- its precise sub-pixel direction (used below to count how many arms
+    # -- a node has and measure the angle between each neighbouring pair) --
     def get_arm_directions(cy, cx):
         h, w = skeleton.shape
         visited = np.zeros_like(skeleton, dtype=bool)
@@ -2157,7 +2348,7 @@ def detect_grid_patterns_robust(img, prune_length=4):
                     arms.append(((dx / norm, dy / norm), path))
         return arms
 
-    def arm_is_straight(path, cy, cx, residual_thresh=0.00025):
+    def arm_is_straight(path, residual_thresh=0.00025):
         if len(path) < 6:
             return True 
 
@@ -2183,9 +2374,9 @@ def detect_grid_patterns_robust(img, prune_length=4):
         normalized = mean_sq_dist / (diag * diag + 1e-6)
         return normalized < residual_thresh
 
-    def any_arm_curved(arms, cy, cx):
-        for direction, path in arms:
-            if not arm_is_straight(path, cy, cx):
+    def any_arm_curved(arms):
+        for _direction, path in arms:
+            if not arm_is_straight(path):
                 return True
         return False
 
@@ -2194,7 +2385,7 @@ def detect_grid_patterns_robust(img, prune_length=4):
             arms = get_arm_directions(cy, cx)
         if len(arms) < 2:
             return False
-        straight_arms = [a for a in arms if arm_is_straight(a[1], cy, cx)]
+        straight_arms = [a for a in arms if arm_is_straight(a[1])]
         for i in range(len(straight_arms)):
             for j in range(i + 1, len(straight_arms)):
                 d1 = straight_arms[i][0]
@@ -2217,12 +2408,12 @@ def detect_grid_patterns_robust(img, prune_length=4):
                     break
         return on >= 0.6 * len(path)
 
-    def has_straight_chord(cx, cy, arms):
+    def has_straight_chord(arms):
         # Through-line made of STRAIGHT arms that are NOT circle arcs.
         if arms is None or len(arms) < 2:
             return False
         sa = [a for a in arms
-              if arm_is_straight(a[1], cy, cx) and not _arm_follows_circle(a[1])]
+              if arm_is_straight(a[1]) and not _arm_follows_circle(a[1])]
         for i in range(len(sa)):
             for j in range(i + 1, len(sa)):
                 d1 = sa[i][0]; d2 = sa[j][0]
@@ -2241,6 +2432,8 @@ def detect_grid_patterns_robust(img, prune_length=4):
         else:
             cv2.circle(img_out, (cx, cy), radius, color, thickness)
 
+    # ---- angle measurement: turn a node's traced arms into the wedge
+    # ---- angle between each neighbouring pair, and label them on the image
     def _wedges_from_dirs(dirs):
         if len(dirs) < 2:
             return []
@@ -2267,7 +2460,7 @@ def detect_grid_patterns_robust(img, prune_length=4):
             results.append((wedge, bx, by))
         return results
 
-    def compute_wedge_angles(cx, cy, is_shape_vertex):
+    def compute_wedge_angles(cx, cy):
         corner_dirs = None
         if shape_type != "Circle" and len(shape_vertices) >= 3:
             match_tol = max(20, img_diag // 40)
@@ -2366,6 +2559,10 @@ def detect_grid_patterns_robust(img, prune_length=4):
 
     all_node_pts = [(p[0], p[1]) for p in all_nodes]
 
+    # ---- PHASE 6: the main per-node loop ----
+    # For every detected node: work out its degree, count and measure its
+    # arms (wedge angles between them), then classify the result into a
+    # taxonomy shape label and record it.
     for (cx, cy, node_type) in all_nodes:
         is_shape_vertex = (node_type == 'vertex')
 
@@ -2417,7 +2614,7 @@ def detect_grid_patterns_robust(img, prune_length=4):
 
         # A node lying on TWO circles with no straight line through it is a
         # circle-circle meeting point (a "lens"): one degree-4 circle marker.
-        _chord = has_straight_chord(scx, scy, arms)
+        _chord = has_straight_chord(arms)
         _lens_tol = max(10, img_diag // 70)
         _on_circ = sum(1 for (ccx, ccy, rr) in detected_circles
                        if abs(math.hypot(cx - ccx, cy - ccy) - rr) < _lens_tol)
@@ -2427,6 +2624,30 @@ def detect_grid_patterns_robust(img, prune_length=4):
                                             detected_circles, _lens_tol)
         is_lens = (node_type not in ('circ6', 'xcross', 'vertex')
                    and _on_circ >= 2 and not _chord and not _has_spoke)
+
+        # A straight wall running exactly tangent to ONE detected circle (a
+        # circle inscribed in a polygon, touching at an edge midpoint, e.g.
+        # S15): right at the contact point the edge and the circle are
+        # indistinguishable, so the arm tracer only ever finds the edge's own
+        # 2 (near-collinear) exits, never the circle's. Treat it as a degree-4
+        # node (2 straight edge arms + 2 circle-arc arms) instead of letting it
+        # fall through as a plain 2-panel corner.
+        _edge_tangent_circle = None
+        if not is_lens and _on_circ == 1 and len(arms) == 2:
+            # Near a true tangency the traced arm can run close enough to the
+            # circle over its whole length that _arm_follows_circle (used by
+            # has_straight_chord) mistakes the STRAIGHT edge arm for a circle
+            # arc and discards it -- so check straightness directly here
+            # instead of relying on has_straight_chord/_chord.
+            (_d0, _p0), (_d1, _p1) = arms[0], arms[1]
+            _opposite = (_d0[0] * _d1[0] + _d0[1] * _d1[1]) < -0.85
+            if (_opposite and arm_is_straight(_p0)
+                    and arm_is_straight(_p1)):
+                for (ccx, ccy, rr) in detected_circles:
+                    if abs(math.hypot(cx - ccx, cy - ccy) - rr) < _lens_tol:
+                        _edge_tangent_circle = (ccx, ccy, rr)
+                        break
+        is_edge_tangent = _edge_tangent_circle is not None
 
         # Degree from a ring count (sees curves that overlap near the node
         # but diverge further out, e.g. a circle arc tangent to an edge).
@@ -2440,6 +2661,8 @@ def detect_grid_patterns_robust(img, prune_length=4):
             degree = 6          # spoke through two circles: 2 + 2 + 2
         elif is_lens:
             degree = 4          # two circles meeting: 2 + 2 arcs
+        elif is_edge_tangent:
+            degree = 4          # straight edge tangent to a circle: 2 + 2 arcs
         else:
             degree = degree_from_ring(skeleton, cx, cy, all_node_pts)
             if degree <= 0:
@@ -2469,7 +2692,7 @@ def detect_grid_patterns_robust(img, prune_length=4):
 
         straight_through = has_through_line(scx, scy, arms)
         on_polygon_edge = on_straight_edge(cx, cy)
-        any_curved = any_arm_curved(arms, scy, scx)
+        any_curved = any_arm_curved(arms)
 
         # Marker shape: SQUARE iff a straight line passes through the node.
         if node_type == 'ring3':
@@ -2482,7 +2705,7 @@ def detect_grid_patterns_robust(img, prune_length=4):
             use_square = True
         elif node_type == 'corner':
             # collapsed cluster: square iff a straight line really passes through
-            use_square = has_straight_chord(scx, scy, arms)
+            use_square = has_straight_chord(arms)
         elif node_type == 'vertex':
             if on_circle_perimeter or on_any_circle:
                 use_square = False
@@ -2493,78 +2716,207 @@ def detect_grid_patterns_robust(img, prune_length=4):
             else:
                 use_square = straight_through
         else:  # 'single': square iff a STRAIGHT (non-arc) line passes through
-            use_square = has_straight_chord(scx, scy, arms)
+            use_square = has_straight_chord(arms)
 
-        wedges = compute_wedge_angles(cx, cy, is_shape_vertex)
+        wedges = compute_wedge_angles(cx, cy)
 
         _lens_ang = None
         _lens_cross = False
+        _crc5_panel_ang = None   # degree-5 node that sits on 2 DIFFERENT circles
         if is_lens:
-            # Two tangent circles meeting: 4 arcs that are nearly collinear (the
-            # circles only TOUCH, they don't cross). Recover the 4 real arc
-            # directions by sampling each circle a marker-radius out on both
-            # sides, then show the genuine panels (two large gaps + two tiny
-            # splays) and label with the real small gap.
+            # Two circles meeting at this node. Nothing here uses
+            # marker_radius (a cosmetic drawing-size constant unrelated to
+            # the drawn geometry) -- every quantity below comes only from
+            # the two circles' own fitted centres and radii.
             _lc = [(ccx, ccy, rr) for (ccx, ccy, rr) in detected_circles
                    if abs(math.hypot(cx - ccx, cy - ccy) - rr) < _lens_tol]
             if len(_lc) >= 2:
                 _lc.sort(key=lambda c: c[2])
                 (_c1x, _c1y, _r1), (_c2x, _c2y, _r2) = _lc[0], _lc[-1]
-                # Angle at which the two circles meet, from the intersection-angle
-                # formula cos = (r1^2 + r2^2 - d^2)/(2 r1 r2). Tangent circles give
-                # 0; circles that CROSS give a real angle (the crossing angle).
-                _cdd = math.hypot(_c1x - _c2x, _c1y - _c2y)
-                _cosr = ((_r1 * _r1 + _r2 * _r2 - _cdd * _cdd)
-                         / (2 * _r1 * _r2) if _r1 > 0 and _r2 > 0 else 1.0)
-                _ang_r = math.degrees(math.acos(max(-1.0, min(1.0, _cosr))))
-                _ac_r = min(_ang_r, 180.0 - _ang_r)
-                _ld = []
-                for (ccx, ccy, rr) in (_lc[0], _lc[-1]):
-                    rlen = math.hypot(cx - ccx, cy - ccy) or 1.0
-                    rxu, ryu = (cx - ccx) / rlen, (cy - ccy) / rlen   # outward radial
-                    txu, tyu = -ryu, rxu                              # tangent
-                    dlt = marker_radius / rr                          # curvature tilt
-                    cd, sd = math.cos(dlt), math.sin(dlt)
-                    # both arcs of this circle lean toward its centre (-radial),
-                    # so all 4 arcs lean inward and the OUTER gap is the wider one
-                    _ld.append((cd * txu - sd * rxu, cd * tyu - sd * ryu))
-                    _ld.append((-cd * txu - sd * rxu, -cd * tyu - sd * ryu))
+                # Each circle's own EXACT tangent at the node is perpendicular
+                # to that circle's own radius into the node. To that, lean
+                # each circle's tangent toward its own centre by a small tilt
+                # -- a fixed 10-degree budget split between the two circles
+                # in proportion to the OTHER circle's radius, so the smaller,
+                # sharper-curving circle always takes the larger share of the
+                # tilt and the bigger, gentler circle takes the smaller share,
+                # and the reading is never exactly 0 even at perfect tangency.
+                # Only r1 and r2 drive the SPLIT; the 10-degree budget itself
+                # is a chosen display constant (not a pixel one like
+                # marker_radius), picked to keep the numbers legible.
+                _tilt_budget = math.radians(10.0)
+                _rsum = _r1 + _r2
+                _dlt1 = _tilt_budget * (_r2 / _rsum) if _rsum > 0 else 0.0
+                _dlt2 = _tilt_budget * (_r1 / _rsum) if _rsum > 0 else 0.0
+
+                _r1len = math.hypot(cx - _c1x, cy - _c1y) or 1.0
+                _r1xu, _r1yu = (cx - _c1x) / _r1len, (cy - _c1y) / _r1len  # outward radial
+                _t1xu, _t1yu = -_r1yu, _r1xu                                 # tangent
+                _cd1, _sd1 = math.cos(_dlt1), math.sin(_dlt1)
+                _lt1xu = _cd1 * _t1xu - _sd1 * _r1xu   # leaned toward circle 1's centre
+                _lt1yu = _cd1 * _t1yu - _sd1 * _r1yu
+
+                _r2len = math.hypot(cx - _c2x, cy - _c2y) or 1.0
+                _r2xu, _r2yu = (cx - _c2x) / _r2len, (cy - _c2y) / _r2len
+                _t2xu, _t2yu = -_r2yu, _r2xu
+                _cd2, _sd2 = math.cos(_dlt2), math.sin(_dlt2)
+                _lt2xu = _cd2 * _t2xu - _sd2 * _r2xu   # leaned toward circle 2's centre
+                _lt2yu = _cd2 * _t2yu - _sd2 * _r2yu
+
+                _ld = [(_lt1xu, _lt1yu), (-_lt1xu, -_lt1yu),
+                       (_lt2xu, _lt2yu), (-_lt2xu, -_lt2yu)]
                 wedges = _wedges_from_dirs(_ld)
                 _sm = sorted(w[0] for w in wedges)[:2]   # the two splay panels
                 _lens_ang = sum(_sm) / len(_sm) if _sm else None
-                # a genuine CROSSING has a real panel splay (the circles cross
-                # at an angle); a TANGENT lens has a tiny splay (~0). The panel
-                # splay is the reliable signal (the intersection-angle formula is
-                # unstable for barely-overlapping circles), corroborated by the
-                # intersection angle when available.
-                _lens_cross = (_lens_ang is not None
-                               and (_lens_ang > 18.0 or _ac_r > 8.0))
-        elif (_on_circ >= 1 and degree == 3
+
+                # K vs X is not about HOW BIG the angle is, it's about which
+                # way the two arcs curve relative to each other. Each
+                # circle's arc bends toward its OWN centre, so the direction
+                # from the node to that centre is the side it curves to. If
+                # both circles curve to the same side of the node (their
+                # centres roughly in the same direction) the arcs hug each
+                # other -- a K element, like a small circle nested just
+                # inside a bigger one. If they curve to opposite sides (their
+                # centres roughly in opposite directions) the arcs bow away
+                # from one another -- a genuine X crossing.
+                _in1xu, _in1yu = -_r1xu, -_r1yu
+                _in2xu, _in2yu = -_r2xu, -_r2yu
+                _lens_cross = (_in1xu * _in2xu + _in1yu * _in2yu) < 0.0
+        elif is_edge_tangent:
+            # A straight wall exactly tangent to one circle: reconstruct the
+            # true 4 arms analytically instead of trusting the arm tracer
+            # (which only ever finds the 2 straight edge exits here). 2 EXACT
+            # edge directions (the wall is straight) + 2 circle-arc directions
+            # leaning toward the circle's own centre by the curvature tilt
+            # (same construction used for the circle-circle lens above).
+            _ecx, _ecy, _er = _edge_tangent_circle
+            _rlen = math.hypot(cx - _ecx, cy - _ecy) or 1.0
+            _rxu, _ryu = (cx - _ecx) / _rlen, (cy - _ecy) / _rlen  # outward radial
+            _txu, _tyu = -_ryu, _rxu                                 # tangent = edge dir
+            _dlt = min(marker_radius / _er, 0.05)   # capped, see note above
+            _cd, _sd = math.cos(_dlt), math.sin(_dlt)
+            wedges = _wedges_from_dirs([
+                (_txu, _tyu),
+                (_cd * _txu - _sd * _rxu, _cd * _tyu - _sd * _ryu),
+                (-_txu, -_tyu),
+                (-_cd * _txu - _sd * _rxu, -_cd * _tyu - _sd * _ryu),
+            ])
+            _tang_sm = sorted(w[0] for w in wedges)[:2]   # the two splay panels
+            _tang_ang = sum(_tang_sm) / len(_tang_sm) if _tang_sm else None
+        elif (_on_circ >= 1
+              and (degree in (3, 5) or (degree == 4 and not use_square))
               and node_type not in ('ring3', 'pcross4', 'xcross', 'circ6')):
-            # 3e-arc node: two of its arms are the same circle's arcs. Their
-            # traced direction is a CHORD over a long arc (wrong on small
-            # circles), so rebuild the wedges from the TANGENT at the node for
-            # arms that run along a detected circle -> the two arcs read as
-            # ~collinear (e.g. a spoke at the top of a circle: 180/90/90).
-            _td = []
-            _ctol = max(6, img_diag // 110)
-            for (_dir, _path) in arms:
-                _fx = _dir
-                for (ccx, ccy, rr) in detected_circles:
-                    if _path and sum(1 for (pr, pc) in _path
-                                     if abs(math.hypot(pc - ccx, pr - ccy) - rr)
-                                     < _ctol) >= 0.7 * len(_path):
-                        _rx, _ry = scx - ccx, scy - ccy
-                        _tx, _ty = -_ry, _rx
-                        if _tx * _dir[0] + _ty * _dir[1] < 0:
-                            _tx, _ty = -_tx, -_ty
-                        _n = math.hypot(_tx, _ty)
-                        if _n > 1e-6:
-                            _fx = (_tx / _n, _ty / _n)
-                        break
-                _td.append(_fx)
-            if len(_td) >= 2:
-                wedges = _wedges_from_dirs(_td)
+            # A node on a detected circle where 2 of its arms are that same
+            # circle's own arcs (3e-arc at degree 3; a spoke + 2 extra chords
+            # meeting the circle at degree 5, e.g. a star point -> "5-crc-panel";
+            # a polygon VERTEX sitting on the circle at degree 4, e.g. a square
+            # inscribed in a circle, where the vertex's own 2 edges are NOT a
+            # through-line -- use_square is already False there, so this never
+            # overlaps the separate "spoke crosses circle" degree-4 correction
+            # below, which only fires when use_square is True).
+            # The circle's two tangent directions at any single point are by
+            # definition exactly opposite (one tangent line, 180 apart) --
+            # but the traced direction is a CHORD over a long arc (wrong on
+            # small/busy circles), so rebuild the wedges from the TRUE TANGENT
+            # at the node for arms that run along a detected circle -> the two
+            # arcs read as ~collinear (e.g. a spoke at the top of a circle:
+            # 180/90/90) instead of the arc gap drifting off true (e.g. 196,
+            # or a square vertex's corner reading 38/90/38/193 instead of the
+            # true 45/90/45/180).
+            #
+            # EXCEPT: a degree-5 node that sits directly on TWO DIFFERENT
+            # circles (e.g. a small circle nested almost-tangent just inside
+            # a much bigger one -- the same pair a direct circle-circle lens
+            # would see) isn't really "a point on one circle plus a spoke" --
+            # it's where two circles themselves meet, with a spoke on top.
+            # This is the SAME small-vs-big circle tilt angle a direct lens
+            # meeting measures (lean each circle's own tangent toward its own
+            # centre by the curvature-share construction, independently, not
+            # forced onto one shared line) -- just read off the WIDE pair of
+            # panels this time instead of the narrow one (is_lens's own
+            # label uses the narrow pair, e.g. a K-arc-6 at a similar C14
+            # pair is really 6/174/6/174 -- the 174 is this same number).
+            # The spoke sits exactly perpendicular to the original tangent,
+            # i.e. exactly on the midline of that wide span, so it splits it
+            # into two EQUAL flanking panels -- shown that way rather than
+            # at the spoke's own slightly-off raw direction, since the two
+            # circles' curvature difference is already fully carried by the
+            # (now wide, not narrow) angle itself.
+            _crc5_lc = ([(ccx, ccy, rr) for (ccx, ccy, rr) in detected_circles
+                         if abs(math.hypot(cx - ccx, cy - ccy) - rr) < _lens_tol]
+                        if degree == 5 else [])
+            if len(_crc5_lc) >= 2:
+                _crc5_lc.sort(key=lambda c: c[2])
+                (_p1x, _p1y, _pr1), (_p2x, _p2y, _pr2) = _crc5_lc[0], _crc5_lc[-1]
+                _tilt_budget5 = math.radians(10.0)
+                _prsum = _pr1 + _pr2
+                _pdlt1 = _tilt_budget5 * (_pr2 / _prsum) if _prsum > 0 else 0.0
+                _pdlt2 = _tilt_budget5 * (_pr1 / _prsum) if _prsum > 0 else 0.0
+
+                _p1len = math.hypot(cx - _p1x, cy - _p1y) or 1.0
+                _p1xu, _p1yu = (cx - _p1x) / _p1len, (cy - _p1y) / _p1len
+                _pt1xu, _pt1yu = -_p1yu, _p1xu
+                _pcd1, _psd1 = math.cos(_pdlt1), math.sin(_pdlt1)
+                _plt1x = _pcd1 * _pt1xu - _psd1 * _p1xu
+                _plt1y = _pcd1 * _pt1yu - _psd1 * _p1yu
+
+                _p2len = math.hypot(cx - _p2x, cy - _p2y) or 1.0
+                _p2xu, _p2yu = (cx - _p2x) / _p2len, (cy - _p2y) / _p2len
+                _pt2xu, _pt2yu = -_p2yu, _p2xu
+                _pcd2, _psd2 = math.cos(_pdlt2), math.sin(_pdlt2)
+                _plt2x = _pcd2 * _pt2xu - _psd2 * _p2xu
+                _plt2y = _pcd2 * _pt2yu - _psd2 * _p2yu
+
+                # Identify the spoke (the raw traced arm LEAST aligned with
+                # either circle's tangent line), purely to tell which of the
+                # two equal wide gaps it actually falls in.
+                _spoke_dir = None
+                _best_score = None
+                for (_adir, _) in arms:
+                    _s1 = abs(_adir[0] * _pt1xu + _adir[1] * _pt1yu)
+                    _s2 = abs(_adir[0] * _pt2xu + _adir[1] * _pt2yu)
+                    _score = max(_s1, _s2)
+                    if _best_score is None or _score < _best_score:
+                        _best_score = _score
+                        _spoke_dir = _adir
+
+                _p4 = _wedges_from_dirs([(_plt1x, _plt1y), (-_plt1x, -_plt1y),
+                                         (_plt2x, _plt2y), (-_plt2x, -_plt2y)])
+                if _spoke_dir is not None and _p4:
+                    # Pick whichever of the 4 gaps the spoke actually sits
+                    # in, by nearest bisector -- not by first filtering to
+                    # "the wide ones", which is numerically fragile (the two
+                    # wide gaps are only equal by symmetry; in float they can
+                    # differ by an epsilon, so an exact-equality filter can
+                    # keep just one of them, which may be the wrong one).
+                    _picked = max(
+                        _p4, key=lambda w: w[1] * _spoke_dir[0] + w[2] * _spoke_dir[1])
+                    _wbx, _wby = _picked[1], _picked[2]
+                    _crc5_panel_ang = _picked[0]
+                    wedges = _wedges_from_dirs([
+                        (_plt1x, _plt1y), (-_plt1x, -_plt1y),
+                        (_plt2x, _plt2y), (-_plt2x, -_plt2y),
+                        (_wbx, _wby)])
+            else:
+                _td = []
+                _ctol = max(6, img_diag // 110)
+                for (_dir, _path) in arms:
+                    _fx = _dir
+                    for (ccx, ccy, rr) in detected_circles:
+                        if _path and sum(1 for (pr, pc) in _path
+                                         if abs(math.hypot(pc - ccx, pr - ccy) - rr)
+                                         < _ctol) >= 0.7 * len(_path):
+                            _rx, _ry = scx - ccx, scy - ccy
+                            _tx, _ty = -_ry, _rx
+                            if _tx * _dir[0] + _ty * _dir[1] < 0:
+                                _tx, _ty = -_tx, -_ty
+                            _n = math.hypot(_tx, _ty)
+                            if _n > 1e-6:
+                                _fx = (_tx / _n, _ty / _n)
+                            break
+                    _td.append(_fx)
+                if len(_td) >= 2:
+                    wedges = _wedges_from_dirs(_td)
         elif (degree == 4 and not is_lens and use_square
               and node_type not in ('circ6', 'pcross4')):
             # A straight line crossing a circle. The spoke is the most-opposite
@@ -2573,17 +2925,26 @@ def detect_grid_patterns_robust(img, prune_length=4):
             # perpendicular '+', it is 4-panel-90. Oblique crossings keep their
             # original (trident/X) reading.
             _nn = len(arms)
-            _best = (1.0, -1, -1)
-            for _i in range(_nn):
-                for _j in range(_i + 1, _nn):
-                    _dd = (arms[_i][0][0] * arms[_j][0][0]
-                           + arms[_i][0][1] * arms[_j][0][1])
-                    if _dd < _best[0]:
-                        _best = (_dd, _i, _j)
-            _arc = [k for k in range(_nn) if k not in (_best[1], _best[2])]
-            if (_best[0] < -0.9 and len(_arc) == 2
-                    and all(arms[k][1] and _arm_follows_circle(arms[k][1])
-                            for k in _arc)):
+            # Identify the 2 arc arms by whether they genuinely follow a
+            # detected circle, NOT by first guessing the spoke as "whichever
+            # pair is most opposite". On a SMALL circle close to another
+            # junction, one spoke arm's trace can get cut short (it hits the
+            # next junction only a few px out) and its SVD-fit direction ends
+            # up noticeably off-axis -- that corrupted arm can then look MORE
+            # "opposite" to an arc arm than the true opposite spoke arm does,
+            # misidentifying which 2 arms are the arc in the first place.
+            # A short, truncated trace (e.g. a spoke arm cut off after a
+            # handful of points because the next junction sits only a few px
+            # away) can spuriously satisfy _arm_follows_circle by chance --
+            # near a tangent point two different circles both pass close by,
+            # so a short segment can look like it "follows" one of them even
+            # though it is really the corrupted spoke arm. Require a decent
+            # minimum length before trusting the circle-following verdict.
+            _arc = [k for k in range(_nn)
+                    if arms[k][1] and len(arms[k][1]) >= 15
+                    and _arm_follows_circle(arms[k][1])]
+            _spoke = [k for k in range(_nn) if k not in _arc]
+            if len(_arc) == 2 and len(_spoke) == 2:
                 _cc = max(6, img_diag // 110)
                 _nd = [a[0] for a in arms]
                 for _k in _arc:
@@ -2599,6 +2960,21 @@ def detect_grid_patterns_robust(img, prune_length=4):
                             if _n > 1e-6:
                                 _nd[_k] = (_tx / _n, _ty / _n)
                             break
+                # The spoke is a single straight line through the node, so its
+                # two measured directions should be opposite. If they aren't,
+                # one was mistraced (cut short near another junction) -- trust
+                # whichever spoke arm traced the LONGER path (more points to
+                # fit, so a more reliable direction) and set the other to its
+                # exact opposite instead of its own corrupted reading.
+                _s0, _s1 = _spoke
+                _dot_spoke = (arms[_s0][0][0] * arms[_s1][0][0]
+                              + arms[_s0][0][1] * arms[_s1][0][1])
+                if _dot_spoke >= -0.9:
+                    _len0 = len(arms[_s0][1]) if arms[_s0][1] else 0
+                    _len1 = len(arms[_s1][1]) if arms[_s1][1] else 0
+                    _trusted, _other = (_s0, _s1) if _len0 >= _len1 else (_s1, _s0)
+                    _td = _nd[_trusted]
+                    _nd[_other] = (-_td[0], -_td[1])
                 # Accept only if the straightened arc gives a perpendicular '+'
                 # (a radial spoke crossing a circle). Oblique crossings keep
                 # their original (trident/X) reading.
@@ -2606,12 +2982,45 @@ def detect_grid_patterns_robust(img, prune_length=4):
                 if _w2 and abs(min(w[0] for w in _w2) - 90.0) < 15.0:
                     arms = [(_nd[i], arms[i][1]) for i in range(len(arms))]
                     wedges = _w2
+        elif node_type == 'circ6':
+            # A straight spoke running through TWO tangent/overlapping
+            # circles: 2 EXACT spoke directions (the line is straight) + 2
+            # EXACT tangent directions PER circle (perpendicular to the
+            # radius from EACH circle's own centre to the node) -- 6 arms
+            # total, same exact-tangent construction as the is_lens fix
+            # above (no cosmetic lean: since the two circles are themselves
+            # tangent to each other here, their tangent lines are genuinely
+            # near-identical, so the "small" panels correctly come out near 0
+            # and the "big" panels near 90, both as exact as the measured
+            # circle fit allows). The raw arm tracer only ever finds ~4: right
+            # at the shared tangent point the two circles' own tangent
+            # directions are nearly identical, so it can't tell them apart as
+            # separate arcs.
+            _c6 = [(ccx, ccy, rr) for (ccx, ccy, rr) in detected_circles
+                   if abs(math.hypot(cx - ccx, cy - ccy) - rr) < _lens_tol]
+            _spoke_dir = None
+            for (_d, _p) in arms:
+                if arm_is_straight(_p) and not _arm_follows_circle(_p):
+                    _spoke_dir = _d
+                    break
+            if _spoke_dir is None and arms:
+                _spoke_dir = arms[0][0]
+            if _spoke_dir is not None and len(_c6) >= 2:
+                _sx, _sy = _spoke_dir
+                _dirs6 = [(_sx, _sy), (-_sx, -_sy)]
+                for (ccx, ccy, rr) in _c6[:2]:
+                    _rlen6 = math.hypot(cx - ccx, cy - ccy) or 1.0
+                    _rxu6, _ryu6 = (cx - ccx) / _rlen6, (cy - ccy) / _rlen6
+                    _txu6, _tyu6 = -_ryu6, _rxu6          # EXACT tangent, no lean
+                    _dirs6.append((_txu6, _tyu6))
+                    _dirs6.append((-_txu6, -_tyu6))
+                wedges = _wedges_from_dirs(_dirs6)
         elif node_type == 'pcross4':
             # A spoke crossing a petal, perpendicular: treat the arc as a straight
             # line and show a clean '+' from the spoke direction -> 4-panel-90.
             _sp = None
             for (_d, _p) in arms:
-                if arm_is_straight(_p, scy, scx) and not _arm_follows_circle(_p):
+                if arm_is_straight(_p) and not _arm_follows_circle(_p):
                     _sp = _d
                     break
             if _sp is None and arms:
@@ -2640,14 +3049,27 @@ def detect_grid_patterns_robust(img, prune_length=4):
         elif node_type == 'ring3':
             shape = "3-panel-claw-arc-90(3e-arc)"
         elif is_lens:
+            # No floor here: 0 is a real, meaningful reading (near-perfect
+            # tangency) and must match the on-image panel numbers exactly,
+            # which are never floored either.
             if _lens_cross:
                 shape = "4-panel-X-%s" % _afmt(
-                    max(1, round(_lens_ang)) if _lens_ang is not None else 90)
+                    round(_lens_ang) if _lens_ang is not None else 90)
             else:
-                shape = "4-panel-K-arc-%s" % _afmt(max(1, round(_lens_ang)) if _lens_ang is not None else 45)
+                shape = "4-panel-K-arc-%s" % _afmt(
+                    round(_lens_ang) if _lens_ang is not None else 45)
+        elif is_edge_tangent:
+            # straight wall tangent to a circle: a degenerate 4-panel-K where
+            # the "second line" is the circle grazing the wall at (near) 0.
+            shape = "4-panel-K-arc-%s" % _afmt(
+                max(1, round(_tang_ang)) if _tang_ang is not None else 5)
+        elif _crc5_panel_ang is not None:
+            # The two-circle lean+spoke construction above already built
+            # `wedges` to match -- the label just reads the same number.
+            shape = "5-crc-panel-(3T+2panel%s)" % _afmt(round(_crc5_panel_ang))
         else:
             _adirs = [a[0] for a in arms]
-            _astr = [arm_is_straight(a[1], scy, scx) for a in arms]
+            _astr = [arm_is_straight(a[1]) for a in arms]
             shape = classify_node_shape(
                 _adirs, _astr, degree, on_circle=(_on_circ >= 1),
                 wedge_angs=[w[0] for w in wedges],
@@ -2658,6 +3080,7 @@ def detect_grid_patterns_robust(img, prune_length=4):
         # shape label instead.
         if shape.startswith("3-panel-claw-90"):
             use_square = True
+
 
         shape_counts[shape] = shape_counts.get(shape, 0) + 1
 
@@ -2670,6 +3093,7 @@ def detect_grid_patterns_robust(img, prune_length=4):
             "angles_deg": [round(float(w[0]), 1) for w in wedges],
         })
 
+    # ---- PHASE 7: consolidate labels, then compute RT / RG / Omega ----
     # Merge near-equal measured angles in the same family (symmetry / noise),
     # e.g. 4-cir-k-31 and 4-cir-k-32 -> one category.
     shape_counts = consolidate_shape_angles(shape_counts, node_records)
@@ -2796,10 +3220,6 @@ def detect_grid_patterns_robust(img, prune_length=4):
         "omega": _OMEGA,
     }
 
-
-# ============================================================
-# AUTO-DISPATCH (Updated for Single-Shape Processing)
-# ============================================================
 
 def detect(img, min_dimension=900):
     """
