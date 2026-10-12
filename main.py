@@ -284,6 +284,32 @@ def composite_reconstruct_len_px(skel, circles, shape_type):
     Lin = skeleton_length_px(inner)
     if N * 0.9 * r <= 0 or abs(Lin - N * 0.9 * r) / (N * 0.9 * r) >= 0.20:
         return None
+
+    # Spokes must actually run to the VERTICES (length Rc), not to the edge
+    # midpoints (length r). Sample each centre->vertex ray in the annulus just
+    # OUTSIDE the circle (1.15 r .. 0.9 Rc); a spoke to a corner leaves skeleton
+    # there, a centre-to-midpoint cross does not. Require most vertices covered.
+    Sset = set(zip(ys.tolist(), xs.tolist()))
+    def _ray_has_skel(vx, vy):
+        ux, uy = (vx - cx), (vy - cy)
+        L = math.hypot(ux, uy) or 1.0
+        ux, uy = ux / L, uy / L
+        hit = 0; tot = 0
+        rr = 1.15 * r
+        while rr <= 0.9 * Rc:
+            tot += 1
+            px, py = cx + ux * rr, cy + uy * rr
+            found = any((int(round(py)) + dr, int(round(px)) + dc) in Sset
+                        for dr in (-2, -1, 0, 1, 2) for dc in (-2, -1, 0, 1, 2))
+            if found:
+                hit += 1
+            rr += 2.0
+        return tot == 0 or hit / tot >= 0.6
+    if Rc > 1.15 * r:                      # only meaningful when corners stick out
+        covered = sum(1 for (vx, vy) in ap if _ray_has_skel(vx, vy))
+        if covered < max(1, int(round(0.75 * N))):
+            return None                    # spokes end at midpoints -> not this composite
+
     Poly = sum(math.hypot(ap[i][0] - ap[(i + 1) % N][0],
                           ap[i][1] - ap[(i + 1) % N][1]) for i in range(N))
     return 2.0 * math.pi * r + Poly + N * Rc
