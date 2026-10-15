@@ -2710,11 +2710,21 @@ def detect_grid_patterns_robust(img, prune_length=4):
         on_circle_perimeter = False
         if circle_geom is not None:
             dist_to_center = math.hypot(cx - circle_geom[0], cy - circle_geom[1])
-            if abs(dist_to_center - circle_geom[2]) < max(8, img_diag // 60):
+            # Tolerance scales with the circle's OWN radius (not a flat
+            # image-size fraction): a vertex meant to sit on a big circle can
+            # be a few percent of that radius off (drawing/generation
+            # imprecision) and should still count as "on the circle", same
+            # as every other on-circle check in this file already does
+            # relative to its own feature size.
+            if abs(dist_to_center - circle_geom[2]) < max(8, 0.05 * circle_geom[2]):
                 on_circle_perimeter = True
 
         circle_tol = max(8, img_diag // 80)
         on_any_circle = is_on_any_circle(cx, cy, detected_circles, circle_tol)
+        if not on_any_circle and detected_circles:
+            on_any_circle = any(
+                abs(math.hypot(cx - ccx, cy - ccy) - rr) < max(8, 0.05 * rr)
+                for (ccx, ccy, rr) in detected_circles)
 
         straight_through = has_through_line(scx, scy, arms)
         on_polygon_edge = on_straight_edge(cx, cy)
@@ -2727,10 +2737,18 @@ def detect_grid_patterns_robust(img, prune_length=4):
             use_square = True            # spoke through a petal -> square
         elif is_lens:
             use_square = False           # circle-circle meeting -> circle
-        elif node_type in ('through', 'xcross', 'circ6'):
+        elif node_type in ('xcross', 'circ6'):
             use_square = True
-        elif node_type == 'corner':
-            # collapsed cluster: square iff a straight line really passes through
+        elif node_type in ('through', 'corner'):
+            # collapsed cluster: square iff a straight line really passes
+            # through. 'through' already means "refine_junction_nodes found
+            # a straight connector in this cluster" and is square in the
+            # ordinary case -- but on a node that ALSO sits on a detected
+            # circle, a diamond/polygon vertex can get mislabelled 'through'
+            # even though its own two edges meet at a genuine corner, not a
+            # straight pass-through, so re-check with the same has_straight_
+            # chord test 'corner' already uses rather than trusting the
+            # upstream label blindly.
             use_square = has_straight_chord(arms)
         elif node_type == 'vertex':
             if on_circle_perimeter or on_any_circle:
