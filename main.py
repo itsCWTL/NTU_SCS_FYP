@@ -3173,7 +3173,10 @@ def detect_grid_patterns_robust(img, prune_length=4):
 
     # ---- RT / RG / Omega panel in the TOP-RIGHT corner of the figure ----
     def _fmt(_v):
-        return "--" if _v is None else ("%.2f" % _v)
+        # round_half_up (not plain %.2f, which rounds half-to-even and is
+        # skewed by binary floating-point) so an exact .XX5 always displays
+        # rounded UP, matching how RT/RG feed into Omega above.
+        return "--" if _v is None else ("%.2f" % _geometry.round_half_up(_v, 2))
     _pf = max(0.5, img_diag / 2300.0)
     _pth = max(1, int(_pf * 2))
     _pfont = cv2.FONT_HERSHEY_SIMPLEX
