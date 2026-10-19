@@ -2796,14 +2796,38 @@ def detect_grid_patterns_robust(img, prune_length=4):
                 _r1len = math.hypot(cx - _c1x, cy - _c1y) or 1.0
                 _r1xu, _r1yu = (cx - _c1x) / _r1len, (cy - _c1y) / _r1len  # outward radial
                 _t1xu, _t1yu = -_r1yu, _r1xu                                 # tangent
-                _cd1, _sd1 = math.cos(_dlt1), math.sin(_dlt1)
-                _lt1xu = _cd1 * _t1xu - _sd1 * _r1xu   # leaned toward circle 1's centre
-                _lt1yu = _cd1 * _t1yu - _sd1 * _r1yu
 
                 _r2len = math.hypot(cx - _c2x, cy - _c2y) or 1.0
                 _r2xu, _r2yu = (cx - _c2x) / _r2len, (cy - _c2y) / _r2len
                 _t2xu, _t2yu = -_r2yu, _r2xu
-                _cd2, _sd2 = math.cos(_dlt2), math.sin(_dlt2)
+
+                # K vs X: which way the two arcs curve relative to each
+                # other. Each circle's arc bends toward its OWN centre, so
+                # the direction from the node to that centre is the side it
+                # curves to. Opposite directions (dot product negative) ->
+                # the arcs bow away from one another, a genuine X crossing.
+                # Same direction (dot product >= 0) -> the arcs hug the same
+                # side, a K element, e.g. a small circle nested just inside
+                # a bigger one. Computed BEFORE the lean below because the
+                # lean's own sign now depends on it.
+                _in1xu, _in1yu = -_r1xu, -_r1yu
+                _in2xu, _in2yu = -_r2xu, -_r2yu
+                _lens_cross = (_in1xu * _in2xu + _in1yu * _in2yu) < 0.0
+
+                # Lean each tangent toward its own centre by its share of the
+                # budget. For a K pair both leans turn the SAME absolute way,
+                # so the result is the DIFFERENCE |dlt1-dlt2| (varies with
+                # the radius ratio). For an X pair (centres opposite) the
+                # second lean is flipped to the OPPOSITE absolute sense, so
+                # the two tangents fan apart instead of sliding together,
+                # giving the SUM dlt1+dlt2.
+                _dlt2_signed = -_dlt2 if _lens_cross else _dlt2
+
+                _cd1, _sd1 = math.cos(_dlt1), math.sin(_dlt1)
+                _lt1xu = _cd1 * _t1xu - _sd1 * _r1xu   # leaned toward circle 1's centre
+                _lt1yu = _cd1 * _t1yu - _sd1 * _r1yu
+
+                _cd2, _sd2 = math.cos(_dlt2_signed), math.sin(_dlt2_signed)
                 _lt2xu = _cd2 * _t2xu - _sd2 * _r2xu   # leaned toward circle 2's centre
                 _lt2yu = _cd2 * _t2yu - _sd2 * _r2yu
 
@@ -2812,20 +2836,6 @@ def detect_grid_patterns_robust(img, prune_length=4):
                 wedges = _wedges_from_dirs(_ld)
                 _sm = sorted(w[0] for w in wedges)[:2]   # the two splay panels
                 _lens_ang = sum(_sm) / len(_sm) if _sm else None
-
-                # K vs X is not about HOW BIG the angle is, it's about which
-                # way the two arcs curve relative to each other. Each
-                # circle's arc bends toward its OWN centre, so the direction
-                # from the node to that centre is the side it curves to. If
-                # both circles curve to the same side of the node (their
-                # centres roughly in the same direction) the arcs hug each
-                # other -- a K element, like a small circle nested just
-                # inside a bigger one. If they curve to opposite sides (their
-                # centres roughly in opposite directions) the arcs bow away
-                # from one another -- a genuine X crossing.
-                _in1xu, _in1yu = -_r1xu, -_r1yu
-                _in2xu, _in2yu = -_r2xu, -_r2yu
-                _lens_cross = (_in1xu * _in2xu + _in1yu * _in2yu) < 0.0
         elif is_edge_tangent:
             # A straight wall exactly tangent to one circle: reconstruct the
             # true 4 arms analytically instead of trusting the arm tracer
