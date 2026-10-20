@@ -52,6 +52,12 @@ def _numeric_template(name):
 # ELEMENT LABEL CONSOLIDATION BY ANGLE CLUSTERING
 # ============================================================
 
+# Per-element override of the consolidation tolerance. Two circles meeting
+# (4-panel-K-arc) give genuinely different angles for different radius pairs
+# (e.g. 6 vs 10), so only near-identical readings are merged there.
+_CONSOLIDATE_TOL_OVERRIDE = {"\x00-panel-K-arc-\x00": 1.0}
+
+
 def consolidate_shape_angles(shape_counts, node_records, tol=5.0):
     """Merge shapes of the SAME element whose measured angles are close, accounting 
     for measurement noise at symmetric nodes. Examples include 4-cir-k-31/32 and 4-panel-(3claw45/46+1).
@@ -74,6 +80,7 @@ def consolidate_shape_angles(shape_counts, node_records, tol=5.0):
         #single-linkage clustering: If A is close enough to B, 
         #and B is close enough to C, all three can end up in one 
         #cluster even if A and C differ by more than 5.
+        _tol = _CONSOLIDATE_TOL_OVERRIDE.get(_tmpl, tol)
         _n = len(_items)
         _parent = list(range(_n))
 
@@ -87,7 +94,7 @@ def consolidate_shape_angles(shape_counts, node_records, tol=5.0):
             for _j in range(_i + 1, _n):
                 _ni, _nj = _items[_i][0], _items[_j][0]
                 if (_ni[0] == _nj[0] and
-                        all(abs(a - b) <= tol for a, b in zip(_ni[1:], _nj[1:]))):
+                        all(abs(a - b) <= _tol for a, b in zip(_ni[1:], _nj[1:]))):
                     _ra, _rb = _find(_i), _find(_j)
                     if _ra != _rb:
                         _parent[_rb] = _ra
@@ -2836,6 +2843,16 @@ def detect_grid_patterns_robust(img, prune_length=4):
                 wedges = _wedges_from_dirs(_ld)
                 _sm = sorted(w[0] for w in wedges)[:2]   # the two splay panels
                 _lens_ang = sum(_sm) / len(_sm) if _sm else None
+
+                # Same-size vs different-size circles. Only two EQUAL circles
+                # are classified by the tangent-direction (K vs X) test above.
+                # Two circles of DIFFERENT radii always meet as a K element
+                # (4-panel-K-arc), whichever side their centres lie on. The
+                # wedges/angle above are left as built so the label number
+                # still matches the on-image panel numbers.
+                _lens_same_size = abs(_r1 - _r2) <= max(3.0, 0.1 * max(_r1, _r2))
+                if not _lens_same_size:
+                    _lens_cross = False
         elif is_edge_tangent:
             # A straight wall exactly tangent to one circle: reconstruct the
             # true 4 arms analytically instead of trusting the arm tracer
